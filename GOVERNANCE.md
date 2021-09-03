@@ -18,14 +18,15 @@ Contributors. Contributors are individuals who have contributed code,
 documentation, designs or other work to one or more Project repositories,
 or who have done significant work to empower the Community,
 moderating on [Discourse](http://docs.pymc.io),
-organizing [PyMCon]() or helped on other platforms and events.
+organizing [PyMCon](https://pymcon.com) or helped on other platforms and events.
 Anyone can be a Contributor. Contributors can be affiliated with any legal
 entity or none. Contributors participate in the project by submitting,
 reviewing and discussing GitHub Pull Requests and Issues and participating in
-open and public Project discussions on GitHub, Slack, Gitter chat rooms and mailing lists. The foundation of Project participation is openness
-and transparency.
+open and public Project discussions on GitHub, Slack, Gitter chat rooms and mailing lists.
+The foundation of Project participation is openness and transparency.
 
-There have been over 250 Contributors to the Project, their contributions are listed in the logs of the PyMC GitHub repositories as well as those of associated projects and venues.
+There have been over 250 Contributors to the Project, their contributions are listed in the
+logs of the PyMC GitHub repositories as well as those of associated projects and venues.
 
 The Project Community consists of all Contributors and Users of the Project.
 Contributors work on behalf of and are responsible to the larger Project
@@ -80,6 +81,8 @@ The Team will generally act as a single unit, except for some specific
 questions where dedicated teams will prevail.
 The PyMC project currently counts with the Developer and Documentation teams.
 Team members can be part of one, some or none of these dedicated teams.
+
+![community_diagram](docs/community_diagram.png)
 
 Anyone working with The Project has the responsibility to personally uphold
 the Code of Conduct. Core Contributors have the additional responsibility
@@ -160,6 +163,10 @@ if they are an institutional contributor/council member -->
 - Adrian Seyboldt
 - Thomas Wiecki
 
+### Past Steering Council members
+
+- Name (year-year)
+
 ### Council membership
 
 To become eligible for being a Steering Council Member an individual must be a
@@ -187,12 +194,12 @@ Council members can renounce at any time and are
 encouraged to do so if they foresee they won't be able to attend their
 responsibilities for an extended interval of time.
 
-If a Council member becomes inactive in the project for a period of one year,
+If a Council member becomes inactive in the project for a period of six months,
 they will be considered for removal from the Council. Before removal, inactive
 Member will be approached by the BDFL to see if they plan on returning to
 active participation. If not they will be removed immediately upon a Council
 vote. If they plan on returning to active participation soon, they will be
-given a grace period of half year. If they don’t return to active participation
+given a grace period of six months. If they don’t return to active participation
 within that time period they will be removed by vote of the Council without
 further grace period. All former Council members can be considered for
 membership again at any time in the future, like any other Core Contributor.
@@ -272,17 +279,23 @@ The current NumFOCUS Subcommittee consists of:
 
 ## Core Contributors
 Core Contributors are those individuals with commit or managing rights to any of
-the repositories or services of the PyMC Project. Therefore, some Core Contributors
-may act as Recurring or Core Contributors depending on the work at hand.
+the repositories or services of the PyMC Project. However, the exact permissions
+of all Core Contributors may not be the same and depend on their team memberships.
+Therefore, Core Contributors may act as Recurrent Contributors depending
+on the task at hand.
 We believe this to be necessary given the current size and scope of
 the PyMC project. Contributors may be proficient in some areas of the
 project while being inexperienced in some others.
 
 ### Core Contributor membership
 To become a Core Contributor, one must already be a Recurring Contributor.
-Core Contributors can nominate any Recurring Contributor to receive commit rights
-and become a Core Contributor. For the nomination to go forward, it has to be
+Core Contributors can nominate any Recurring Contributor to become a
+Core Contributor. For the nomination to go forward, it has to be
 ratified by the Steering Council and the BDFL.
+For a nomination to be rejected, clear reasoning behind the decision must be
+shared with the rest of the team. People whose nomination has been rejected can
+be nominated at any time again in the future, three months after the previous
+nomination at the earliest.
 
 ### Current Core Contributors
 
@@ -307,6 +320,10 @@ Recurring Contributors can nominate any Contributor to participate in the
 Project private communication channels and become a Recurring Contributor.
 For the nomination to go forward, it has to be ratified by
 the Steering Council and the BDFL.
+For a nomination to be rejected, clear reasoning behind the decision must be
+shared with the rest of the team. People whose nomination has been rejected can
+be nominated at any time again in the future, three months after the previous
+nomination at the earliest.
 
 #### Current Recurring Contributors
 
@@ -366,7 +383,7 @@ These dedicated teams have no difference in how they are governed.
 Decisions should be reached by consensus within the team with the Steering
 Council and the BDFL acting if necessary.
 
-The dedicated teams are a work units with two main objectives: better
+The dedicated teams are work units with two main objectives: better
 distributing the work related to The Project, and to better showcase all the task
 involved in The Project to attract more diverse Contributors.
 
@@ -393,7 +410,18 @@ but also making sure there are resources to learn Bayesian statistics with
 PyMC3.
 
 #### Current Documentation Team
+
+- Abhipsha Das
+- Chris Fonnesbeck
+- Lorenzo Toniazzi
+- Martina Cantaro
+- Meenal Jhajharia
+- Olga Kahn
 - Oriol Abril-Pla
+- Raul Maldonado
+- Ravin Kumar
+- Sayam Kumar
+-
 
 ## Institutional Partners and Funding
 
