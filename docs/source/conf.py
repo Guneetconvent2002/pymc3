@@ -104,7 +104,7 @@ language = None
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
-exclude_patterns = ["_build", "**.ipynb_checkpoints"]
+exclude_patterns = ["_build", "**.ipynb_checkpoints", "pymc-examples/.github"]
 
 # myst and panels config
 jupyter_execute_notebooks = "off"
@@ -144,6 +144,8 @@ todo_include_todos = False
 # intersphinx configuration to ease linking arviz docs
 intersphinx_mapping = {
     "arviz": ("https://arviz-devs.github.io/arviz/", None),
+    "aesara": ("https://aesara.readthedocs.io/en/latest/", None),
+    "numpy": ("https://numpy.org/doc/stable/", None),
 }
 
 

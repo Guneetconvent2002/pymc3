@@ -66,12 +66,15 @@ class BaseHMC(GradientSharedStep):
 
         Parameters
         ----------
-        vars: list of Aesara variables
-        scaling: array_like, ndim = {1,2}
+        vars: list, default=None
+            List of Aesara variables. If None, all continuous RVs from the
+            model are included.
+        scaling: array_like, ndim={1,2}
             Scaling for momentum distribution. 1d arrays interpreted matrix
             diagonal.
         step_scale: float, default=0.25
-            Size of steps to take, automatically scaled down by 1/n**(1/4)
+            Size of steps to take, automatically scaled down by 1/n**(1/4),
+            where n is the dimensionality of the parameter space
         is_cov: bool, default=False
             Treat scaling as a covariance matrix/vector if True, else treat
             it as a precision matrix/vector
@@ -98,8 +101,9 @@ class BaseHMC(GradientSharedStep):
         # XXX: If the dimensions of these terms change, the step size
         # dimension-scaling should change as well, no?
         test_point = self._model.initial_point
-        continuous_vars = [test_point[v.name] for v in self._model.cont_vars]
-        size = sum(v.size for v in continuous_vars)
+
+        nuts_vars = [test_point[v.name] for v in vars]
+        size = sum(v.size for v in nuts_vars)
 
         self.step_size = step_scale / (size ** 0.25)
         self.step_adapt = step_sizes.DualAverageAdaptation(
@@ -134,9 +138,9 @@ class BaseHMC(GradientSharedStep):
 
     @abstractmethod
     def _hamiltonian_step(self, start, p0, step_size):
-        """Compute one hamiltonian trajectory and return the next state.
+        """Compute one Hamiltonian trajectory and return the next state.
 
-        Subclasses must overwrite this method and return a `HMCStepData`.
+        Subclasses must overwrite this abstract method and return an `HMCStepData` object.
         """
 
     def astep(self, q0):

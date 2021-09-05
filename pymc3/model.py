@@ -13,8 +13,9 @@
 #   limitations under the License.
 
 import collections
-import itertools
+import functools
 import threading
+import types
 import warnings
 
 from sys import modules
@@ -37,8 +38,8 @@ import aesara.tensor as at
 import numpy as np
 import scipy.sparse as sps
 
+from aesara.compile.mode import Mode, get_mode
 from aesara.compile.sharedvalue import SharedVariable
-from aesara.gradient import grad
 from aesara.graph.basic import Constant, Variable, graph_inputs
 from aesara.graph.fg import FunctionGraph
 from aesara.tensor.random.opt import local_subtensor_rv_lift
@@ -58,6 +59,7 @@ from pymc3.aesaraf import (
 from pymc3.blocking import DictToArrayBijection, RaveledVars
 from pymc3.data import GenTensorVariable, Minibatch
 from pymc3.distributions import logp_transform, logpt, logpt_sum
+from pymc3.distributions.transforms import Transform
 from pymc3.exceptions import ImputationWarning, SamplingError, ShapeError
 from pymc3.math import flatten_list
 from pymc3.util import UNSET, WithMemoization, get_var_name, treedict, treelist
@@ -445,7 +447,7 @@ class ValueGradFunction:
             givens.append((var, shared))
 
         if compute_grads:
-            grads = grad(cost, grad_vars, disconnected_inputs="ignore")
+            grads = aesara.grad(cost, grad_vars, disconnected_inputs="ignore")
             for grad_wrt, var in zip(grads, grad_vars):
                 grad_wrt.name = f"{var.name}_grad"
             outputs = [cost] + grads
@@ -647,7 +649,7 @@ class Model(Factor, WithMemoization, metaclass=ContextMeta):
 
         # The sequence of model-generated RNGs
         self.rng_seq = []
-        self.initial_values = {}
+        self._initial_values = {}
 
         if self.parent is not None:
             self.named_vars = treedict(parent=self.parent.named_vars)
@@ -667,6 +669,13 @@ class Model(Factor, WithMemoization, metaclass=ContextMeta):
             self.auto_deterministics = treelist()
             self.deterministics = treelist()
             self.potentials = treelist()
+
+        from pymc3.printing import str_for_model
+
+        self.str_repr = types.MethodType(str_for_model, self)
+        self._repr_latex_ = types.MethodType(
+            functools.partial(str_for_model, formatting="latex"), self
+        )
 
     @property
     def model(self):
@@ -801,7 +810,7 @@ class Model(Factor, WithMemoization, metaclass=ContextMeta):
     @property
     def datalogpt(self):
         with self:
-            factors = [logpt(obs, obs.tag.observations) for obs in self.observed_RVs]
+            factors = [logpt_sum(obs, obs.tag.observations) for obs in self.observed_RVs]
 
             # Convert random variables into their log-likelihood inputs and
             # apply their transforms, if any
@@ -904,7 +913,8 @@ class Model(Factor, WithMemoization, metaclass=ContextMeta):
         return inputvars(self.unobserved_RVs)
 
     @property
-    def test_point(self):
+    def test_point(self) -> Dict[str, np.ndarray]:
+        """Deprecated alias for `Model.initial_point`."""
         warnings.warn(
             "`Model.test_point` has been deprecated. Use `Model.initial_point` instead.",
             DeprecationWarning,
@@ -912,8 +922,18 @@ class Model(Factor, WithMemoization, metaclass=ContextMeta):
         return self.initial_point
 
     @property
-    def initial_point(self):
+    def initial_point(self) -> Dict[str, np.ndarray]:
+        """Maps names of variables to initial values."""
         return Point(list(self.initial_values.items()), model=self)
+
+    @property
+    def initial_values(self) -> Dict[TensorVariable, np.ndarray]:
+        """Maps transformed variables to initial values.
+
+        ⚠ The keys are NOT the objects returned by, `pm.Normal(...)`.
+        For a name-based dictionary use the `initial_point` property.
+        """
+        return self._initial_values
 
     @property
     def disc_vars(self):
@@ -926,47 +946,86 @@ class Model(Factor, WithMemoization, metaclass=ContextMeta):
         return list(typefilter(self.value_vars, continuous_types))
 
     def set_initval(self, rv_var, initval):
-        initval = (
-            rv_var.type.filter(initval)
-            if initval is not None
-            else getattr(rv_var.tag, "test_value", None)
-        )
+        if initval is not None:
+            initval = rv_var.type.filter(initval)
+
+        test_value = getattr(rv_var.tag, "test_value", None)
 
         rv_value_var = self.rvs_to_values[rv_var]
         transform = getattr(rv_value_var.tag, "transform", None)
 
         if initval is None or transform:
-            # Sample/evaluate this using the existing initial values, and
-            # with the least effect on the RNGs involved (i.e. no in-placing)
-            from aesara.compile.mode import Mode, get_mode
-
-            mode = get_mode(None)
-            opt_qry = mode.provided_optimizer.excluding("random_make_inplace")
-            mode = Mode(linker=mode.linker, optimizer=opt_qry)
-
-            if transform:
-                value = initval if initval is not None else rv_var
-                rv_var = transform.forward(rv_var, value)
-
-            def initval_to_rvval(value_var, value):
-                rv_var = self.values_to_rvs[value_var]
-                initval = value_var.type.make_constant(value)
-                transform = getattr(value_var.tag, "transform", None)
-                if transform:
-                    return transform.backward(rv_var, initval)
-                else:
-                    return initval
-
-            givens = {
-                self.values_to_rvs[k]: initval_to_rvval(k, v)
-                for k, v in self.initial_values.items()
-            }
-            initval_fn = aesara.function(
-                [], rv_var, mode=mode, givens=givens, on_unused_input="ignore"
-            )
-            initval = initval_fn()
+            initval = self._eval_initval(rv_var, initval, test_value, transform)
 
         self.initial_values[rv_value_var] = initval
+
+    def _eval_initval(
+        self,
+        rv_var: TensorVariable,
+        initval: Optional[Variable],
+        test_value: Optional[np.ndarray],
+        transform: Optional[Transform],
+    ) -> np.ndarray:
+        """Sample/evaluate an initial value using the existing initial values,
+        and with the least effect on the RNGs involved (i.e. no in-placing).
+
+        Parameters
+        ----------
+        rv_var : TensorVariable
+            The model variable the initival belongs to.
+        initval : Variable or None
+            The initial value to be evaluated.
+            If `None` a random draw will be made.
+        test_value : optional, ndarray
+            Fallback option if initval is None and random draws are not implemented.
+            This is relevant for pm.Flat or pm.HalfFlat distributions and is subject
+            to ongoing refactoring of the initval API.
+        transform : optional, Transform
+            A transformation associated with the random variable.
+            Transformations are automatically applied to initial values.
+
+        Returns
+        -------
+        initval : np.ndarray
+            Numeric (transformed) initial value.
+        """
+        mode = get_mode(None)
+        opt_qry = mode.provided_optimizer.excluding("random_make_inplace")
+        mode = Mode(linker=mode.linker, optimizer=opt_qry)
+
+        if transform:
+            if initval is not None:
+                value = initval
+            else:
+                value = rv_var
+            rv_var = at.as_tensor_variable(transform.forward(rv_var, value))
+
+        def initval_to_rvval(value_var, value):
+            rv_var = self.values_to_rvs[value_var]
+            initval = value_var.type.make_constant(value)
+            transform = getattr(value_var.tag, "transform", None)
+            if transform:
+                return transform.backward(rv_var, initval)
+            else:
+                return initval
+
+        givens = {
+            self.values_to_rvs[k]: initval_to_rvval(k, v) for k, v in self.initial_values.items()
+        }
+        initval_fn = aesara.function([], rv_var, mode=mode, givens=givens, on_unused_input="ignore")
+        try:
+            initval = initval_fn()
+        except NotImplementedError as ex:
+            if "Cannot sample from" in ex.args[0]:
+                # The RV does not have a random number generator.
+                # Our last chance is to take the test_value.
+                # Note that this is a workaround for Flat and HalfFlat
+                # until an initval default mechanism is implemented (#4752).
+                initval = test_value
+            else:
+                raise
+
+        return initval
 
     def next_rng(self) -> RandomStateSharedVariable:
         """Generate a new ``RandomStateSharedVariable``.
@@ -1523,7 +1582,7 @@ class Model(Factor, WithMemoization, metaclass=ContextMeta):
         r"""Update point `a` with `b`, without overwriting existing keys.
 
         Values specified for transformed variables in `a` will be recomputed
-        conditional on the valures of `b` and stored in `b`.
+        conditional on the values of `b` and stored in `b`.
 
         """
         # TODO FIXME XXX: If we're going to incrementally update transformed
@@ -1629,46 +1688,6 @@ class Model(Factor, WithMemoization, metaclass=ContextMeta):
             name="Log-probability of test_point",
         )
 
-    def _str_repr(self, formatting="plain", **kwargs):
-        all_rv = itertools.chain(self.unobserved_RVs, self.observed_RVs)
-
-        if "latex" in formatting:
-            rv_reprs = [rv.__latex__(formatting=formatting) for rv in all_rv]
-            rv_reprs = [
-                rv_repr.replace(r"\sim", r"&\sim &").strip("$")
-                for rv_repr in rv_reprs
-                if rv_repr is not None
-            ]
-            return r"""$$
-                \begin{{array}}{{rcl}}
-                {}
-                \end{{array}}
-                $$""".format(
-                "\\\\".join(rv_reprs)
-            )
-        else:
-            rv_reprs = [rv.__str__() for rv in all_rv]
-            rv_reprs = [
-                rv_repr for rv_repr in rv_reprs if "TransformedDistribution()" not in rv_repr
-            ]
-            # align vars on their ~
-            names = [s[: s.index("~") - 1] for s in rv_reprs]
-            distrs = [s[s.index("~") + 2 :] for s in rv_reprs]
-            maxlen = str(max(len(x) for x in names))
-            rv_reprs = [
-                ("{name:>" + maxlen + "} ~ {distr}").format(name=n, distr=d)
-                for n, d in zip(names, distrs)
-            ]
-            return "\n".join(rv_reprs)
-
-    def __str__(self, **kwargs):
-        return self._str_repr(formatting="plain", **kwargs)
-
-    def _repr_latex_(self, *, formatting="latex", **kwargs):
-        return self._str_repr(formatting=formatting, **kwargs)
-
-    __latex__ = _repr_latex_
-
 
 # this is really disgusting, but it breaks a self-loop: I can't pass Model
 # itself as context class init arg.
@@ -1750,7 +1769,7 @@ def fastfn(outs, mode=None, model=None):
     return model.fastfn(outs, mode)
 
 
-def Point(*args, filter_model_vars=False, **kwargs):
+def Point(*args, filter_model_vars=False, **kwargs) -> Dict[str, np.ndarray]:
     """Build a point. Uses same args as dict() does.
     Filters out variables not in the model. All keys are strings.
 
@@ -1758,6 +1777,8 @@ def Point(*args, filter_model_vars=False, **kwargs):
     ----------
     args, kwargs
         arguments to build a dict
+    filter_model_vars : bool
+        If `True`, only model variables are included in the result.
     """
     model = modelcontext(kwargs.pop("model", None))
     args = list(args)
@@ -1801,6 +1822,10 @@ compilef = fastfn
 def Deterministic(name, var, model=None, dims=None, auto=False):
     """Create a named deterministic variable
 
+    Notes
+    -----
+    Deterministic nodes are ones that given all the inputs are not random variables
+
     Parameters
     ----------
     name: str
@@ -1821,6 +1846,18 @@ def Deterministic(name, var, model=None, dims=None, auto=False):
     else:
         model.deterministics.append(var)
     model.add_random_variable(var, dims)
+
+    from pymc3.printing import str_for_potential_or_deterministic
+
+    var.str_repr = types.MethodType(
+        functools.partial(str_for_potential_or_deterministic, dist_name="Deterministic"), var
+    )
+    var._repr_latex_ = types.MethodType(
+        functools.partial(
+            str_for_potential_or_deterministic, dist_name="Deterministic", formatting="latex"
+        ),
+        var,
+    )
 
     return var
 
@@ -1904,4 +1941,17 @@ def Potential(name, var, model=None):
     var.tag.scaling = 1.0
     model.potentials.append(var)
     model.add_random_variable(var)
+
+    from pymc3.printing import str_for_potential_or_deterministic
+
+    var.str_repr = types.MethodType(
+        functools.partial(str_for_potential_or_deterministic, dist_name="Potential"), var
+    )
+    var._repr_latex_ = types.MethodType(
+        functools.partial(
+            str_for_potential_or_deterministic, dist_name="Potential", formatting="latex"
+        ),
+        var,
+    )
+
     return var

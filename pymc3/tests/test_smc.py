@@ -12,22 +12,24 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-import time
-
-import aesara
 import aesara.tensor as at
 import numpy as np
 import pytest
+import scipy.stats as st
 
 from arviz.data.inference_data import InferenceData
 
 import pymc3 as pm
 
+from pymc3.aesaraf import floatX
 from pymc3.backends.base import MultiTrace
+from pymc3.smc.smc import IMH
 from pymc3.tests.helpers import SeededTest
 
 
 class TestSMC(SeededTest):
+    """Tests for the default SMC kernel"""
+
     def setup_class(self):
         super().setup_class()
         self.samples = 1000
@@ -66,31 +68,52 @@ class TestSMC(SeededTest):
             x = pm.Normal("x", 0, 1)
             y = pm.Normal("y", x, 1, observed=0)
 
-        with pm.Model() as self.slow_model:
-            x = pm.Normal("x", 0, 1)
-            y = pm.Normal("y", x, 1, observed=100)
-
     def test_sample(self):
         with self.SMC_test:
-
-            mtrace = pm.sample_smc(
-                draws=self.samples,
-                cores=1,  # Fails in parallel due to #4799
-                return_inferencedata=False,
-            )
+            mtrace = pm.sample_smc(draws=self.samples, return_inferencedata=False)
 
         x = mtrace["X"]
         mu1d = np.abs(x).mean(axis=0)
         np.testing.assert_allclose(self.muref, mu1d, rtol=0.0, atol=0.03)
 
-    def test_discrete_continuous(self):
-        with pm.Model() as model:
-            a = pm.Poisson("a", 5)
-            b = pm.HalfNormal("b", 10)
-            y = pm.Normal("y", a, b, observed=[1, 2, 3, 4])
-            trace = pm.sample_smc(draws=10)
+    def test_discrete_rounding_proposal(self):
+        """
+        Test that discrete variable values are automatically rounded
+        in SMC logp functions
+        """
 
-    def test_ml(self):
+        with pm.Model() as m:
+            z = pm.Bernoulli("z", p=0.7)
+            like = pm.Potential("like", z * 1.0)
+
+        smc = IMH(model=m)
+        smc.initialize_population()
+        smc._initialize_kernel()
+
+        assert smc.prior_logp_func(floatX(np.array([-0.51]))) == -np.inf
+        assert np.isclose(smc.prior_logp_func(floatX(np.array([-0.49]))), np.log(0.3))
+        assert np.isclose(smc.prior_logp_func(floatX(np.array([0.49]))), np.log(0.3))
+        assert np.isclose(smc.prior_logp_func(floatX(np.array([0.51]))), np.log(0.7))
+        assert smc.prior_logp_func(floatX(np.array([1.51]))) == -np.inf
+
+    def test_unobserved_discrete(self):
+        n = 10
+        rng = self.get_random_state()
+
+        z_true = np.zeros(n, dtype=int)
+        z_true[int(n / 2) :] = 1
+        y = st.norm(np.array([-1, 1])[z_true], 0.25).rvs(random_state=rng)
+
+        with pm.Model() as m:
+            z = pm.Bernoulli("z", p=0.5, size=n)
+            mu = pm.math.switch(z, 1.0, -1.0)
+            like = pm.Normal("like", mu=mu, sigma=0.25, observed=y)
+
+            trace = pm.sample_smc(chains=1, return_inferencedata=False)
+
+        assert np.all(np.median(trace["z"], axis=0) == z_true)
+
+    def test_marginal_likelihood(self):
         data = np.repeat([1, 0], [50, 50])
         marginals = []
         a_prior_0, b_prior_0 = 1.0, 1.0
@@ -103,7 +126,7 @@ class TestSMC(SeededTest):
                 trace = pm.sample_smc(2000, return_inferencedata=False)
                 marginals.append(trace.report.log_marginal_likelihood)
         # compare to the analytical result
-        assert abs(np.exp(np.mean(marginals[1]) - np.mean(marginals[0])) - 4.0) <= 1
+        assert abs(np.exp(np.nanmean(marginals[1]) - np.nanmean(marginals[0])) - 4.0) <= 1
 
     def test_start(self):
         with pm.Model() as model:
@@ -116,13 +139,42 @@ class TestSMC(SeededTest):
             }
             trace = pm.sample_smc(500, chains=1, start=start)
 
-    def test_slowdown_warning(self):
-        with aesara.config.change_flags(floatX="float32"):
-            with pytest.warns(UserWarning, match="SMC sampling may run slower due to"):
-                with pm.Model() as model:
-                    a = pm.Poisson("a", 5)
-                    y = pm.Normal("y", a, 5, observed=[1, 2, 3, 4])
-                    trace = pm.sample_smc(draws=100, chains=2, cores=1)
+    def test_kernel_kwargs(self):
+        with self.fast_model:
+            trace = pm.sample_smc(
+                draws=10,
+                chains=1,
+                threshold=0.7,
+                n_steps=15,
+                tune_steps=False,
+                p_acc_rate=0.5,
+                return_inferencedata=False,
+                kernel=pm.smc.IMH,
+            )
+
+            assert trace.report.threshold == 0.7
+            assert trace.report.n_draws == 10
+            assert trace.report.n_tune == 15
+            assert trace.report.tune_steps is False
+            assert trace.report.p_acc_rate == 0.5
+
+        with self.fast_model:
+            trace = pm.sample_smc(
+                draws=10,
+                chains=1,
+                threshold=0.95,
+                n_steps=15,
+                tune_steps=False,
+                p_acc_rate=0.5,
+                return_inferencedata=False,
+                kernel=pm.smc.MH,
+            )
+
+            assert trace.report.threshold == 0.95
+            assert trace.report.n_draws == 10
+            assert trace.report.n_tune == 15
+            assert trace.report.tune_steps is False
+            assert trace.report.p_acc_rate == 0.5
 
     @pytest.mark.parametrize("chains", (1, 2))
     def test_return_datatype(self, chains):
@@ -149,37 +201,39 @@ class TestSMC(SeededTest):
             ):
                 pm.sample_smc(draws=99)
 
-    def test_parallel_sampling(self):
-        # Cache graph
-        with self.slow_model:
-            _ = pm.sample_smc(draws=10, chains=1, cores=1, return_inferencedata=False)
-
-        chains = 4
-        draws = 100
-
-        t0 = time.time()
-        with self.slow_model:
-            idata = pm.sample_smc(draws=draws, chains=chains, cores=4)
-        t_mp = time.time() - t0
-        assert idata.posterior.dims["chain"] == chains
-        assert idata.posterior.dims["draw"] == draws
-
-        t0 = time.time()
-        with self.slow_model:
-            idata = pm.sample_smc(draws=draws, chains=chains, cores=1)
-        t_seq = time.time() - t0
-        assert idata.posterior.dims["chain"] == chains
-        assert idata.posterior.dims["draw"] == draws
-
-        assert t_mp < t_seq
-
-    def test_depracated_parallel_arg(self):
+    def test_deprecated_parallel_arg(self):
         with self.fast_model:
             with pytest.warns(
                 DeprecationWarning,
                 match="The argument parallel is deprecated",
             ):
                 pm.sample_smc(draws=10, chains=1, parallel=False)
+
+    def test_deprecated_abc_args(self):
+        with self.fast_model:
+            with pytest.warns(
+                DeprecationWarning,
+                match='The kernel string argument "ABC" in sample_smc has been deprecated',
+            ):
+                pm.sample_smc(draws=10, chains=1, kernel="ABC")
+
+            with pytest.warns(
+                DeprecationWarning,
+                match='The kernel string argument "Metropolis" in sample_smc has been deprecated',
+            ):
+                pm.sample_smc(draws=10, chains=1, kernel="Metropolis")
+
+            with pytest.warns(
+                DeprecationWarning,
+                match="save_sim_data has been deprecated",
+            ):
+                pm.sample_smc(draws=10, chains=1, save_sim_data=True)
+
+            with pytest.warns(
+                DeprecationWarning,
+                match="save_log_pseudolikelihood has been deprecated",
+            ):
+                pm.sample_smc(draws=10, chains=1, save_log_pseudolikelihood=True)
 
 
 @pytest.mark.xfail(reason="SMC-ABC not refactored yet")
@@ -295,3 +349,28 @@ class TestSMCABC(SeededTest):
             )
             with pytest.raises(NotImplementedError, match="named models"):
                 pm.sample_smc(draws=10, kernel="ABC")
+
+
+class TestMHKernel(SeededTest):
+    def test_normal_model(self):
+        data = st.norm(10, 0.5).rvs(1000, random_state=self.get_random_state())
+        with pm.Model() as m:
+            mu = pm.Normal("mu", 0, 3)
+            sigma = pm.HalfNormal("sigma", 1)
+            y = pm.Normal("y", mu, sigma, observed=data)
+            idata = pm.sample_smc(draws=2000, kernel=pm.smc.MH)
+
+        post = idata.posterior.stack(sample=("chain", "draw"))
+        assert np.abs(post["mu"].mean() - 10) < 0.1
+        assert np.abs(post["sigma"].mean() - 0.5) < 0.05
+
+    def test_proposal_dist_shape(self):
+        with pm.Model() as m:
+            x = pm.Normal("x", 0, 1)
+            y = pm.Normal("y", x, 1, observed=0)
+            trace = pm.sample_smc(
+                draws=10,
+                chains=1,
+                kernel=pm.smc.MH,
+                return_inferencedata=False,
+            )

@@ -24,19 +24,18 @@ import aesara.tensor as at
 import numpy as np
 import scipy
 
+from aesara.assert_op import Assert
 from aesara.graph.basic import Apply
 from aesara.graph.op import Op
-from aesara.tensor import gammaln
+from aesara.sparse.basic import sp_sum
+from aesara.tensor import gammaln, sigmoid
 from aesara.tensor.nlinalg import det, eigh, matrix_inverse, trace
 from aesara.tensor.random.basic import MultinomialRV, dirichlet, multivariate_normal
 from aesara.tensor.random.op import RandomVariable, default_shape_from_params
 from aesara.tensor.random.utils import broadcast_params
-from aesara.tensor.slinalg import (
-    Cholesky,
-    Solve,
-    solve_lower_triangular,
-    solve_upper_triangular,
-)
+from aesara.tensor.slinalg import Cholesky
+from aesara.tensor.slinalg import solve_lower_triangular as solve_lower
+from aesara.tensor.slinalg import solve_upper_triangular as solve_upper
 from aesara.tensor.type import TensorType
 from scipy import linalg, stats
 
@@ -56,6 +55,7 @@ __all__ = [
     "Dirichlet",
     "Multinomial",
     "DirichletMultinomial",
+    "OrderedMultinomial",
     "Wishart",
     "WishartBartlett",
     "LKJCorr",
@@ -65,7 +65,6 @@ __all__ = [
     "CAR",
 ]
 
-solve_lower = Solve(A_structure="lower_triangular")
 # Step methods and advi do not catch LinAlgErrors at the
 # moment. We work around that by using a cholesky op
 # that returns a nan as first entry instead of raising
@@ -112,17 +111,13 @@ def quaddist_parse(value, mu, cov, mat_type="cov"):
         onedim = False
 
     delta = value - mu
-
-    if mat_type == "cov":
-        # Use this when Theano#5908 is released.
-        # return MvNormalLogp()(self.cov, delta)
-        chol_cov = cholesky(cov)
+    # Use this when Theano#5908 is released.
+    # return MvNormalLogp()(self.cov, delta)
+    chol_cov = cholesky(cov)
+    if mat_type != "tau":
         dist, logdet, ok = quaddist_chol(delta, chol_cov)
-    elif mat_type == "tau":
-        dist, logdet, ok = quaddist_tau(delta, chol_cov)
     else:
-        dist, logdet, ok = quaddist_chol(delta, chol_cov)
-
+        dist, logdet, ok = quaddist_tau(delta, chol_cov)
     if onedim:
         return dist[0], logdet, ok
 
@@ -396,7 +391,6 @@ class Dirichlet(Continuous):
     a: array
         Concentration parameters (a > 0).
     """
-
     rv_op = dirichlet
 
     def __new__(cls, name, *args, **kwargs):
@@ -405,7 +399,6 @@ class Dirichlet(Continuous):
 
     @classmethod
     def dist(cls, a, **kwargs):
-
         a = at.as_tensor_variable(a)
         # mean = a / at.sum(a)
         # mode = at.switch(at.all(a > 1), (a - 1) / at.sum(a - 1), np.nan)
@@ -499,16 +492,10 @@ class Multinomial(Discrete):
 
     @classmethod
     def dist(cls, n, p, *args, **kwargs):
-
         p = p / at.sum(p, axis=-1, keepdims=True)
         n = at.as_tensor_variable(n)
         p = at.as_tensor_variable(p)
 
-        # mean = n * p
-        # mode = at.cast(at.round(mean), "int32")
-        # diff = n - at.sum(mode, axis=-1, keepdims=True)
-        # inc_bool_arr = at.abs_(diff) > 0
-        # mode = at.inc_subtensor(mode[inc_bool_arr.nonzero()], diff[inc_bool_arr.nonzero()])
         return super().dist([n, p], *args, **kwargs)
 
     def logp(value, n, p):
@@ -518,7 +505,7 @@ class Multinomial(Discrete):
 
         Parameters
         ----------
-        x: numeric
+        value: numeric
             Value for which log-probability is calculated.
 
         Returns
@@ -534,6 +521,46 @@ class Multinomial(Discrete):
             at.all(at.ge(n, 0)),
             broadcast_conditions=False,
         )
+
+
+class DirichletMultinomialRV(RandomVariable):
+    name = "dirichlet_multinomial"
+    ndim_supp = 1
+    ndims_params = [0, 1]
+    dtype = "int64"
+    _print_name = ("DirichletMN", "\\operatorname{DirichletMN}")
+
+    def _shape_from_params(self, dist_params, rep_param_idx=1, param_shapes=None):
+        return default_shape_from_params(self.ndim_supp, dist_params, rep_param_idx, param_shapes)
+
+    @classmethod
+    def rng_fn(cls, rng, n, a, size):
+
+        if n.ndim > 0 or a.ndim > 1:
+            n, a = broadcast_params([n, a], cls.ndims_params)
+            size = tuple(size or ())
+
+            if size:
+                n = np.broadcast_to(n, size + n.shape)
+                a = np.broadcast_to(a, size + a.shape)
+
+            res = np.empty(a.shape)
+            for idx in np.ndindex(a.shape[:-1]):
+                p = rng.dirichlet(a[idx])
+                res[idx] = rng.multinomial(n[idx], p)
+            return res
+        else:
+            # n is a scalar, a is a 1d array
+            p = rng.dirichlet(a, size=size)  # (size, a.shape)
+
+            res = np.empty(p.shape)
+            for idx in np.ndindex(p.shape[:-1]):
+                res[idx] = rng.multinomial(n, p[idx])
+
+            return res
+
+
+dirichlet_multinomial = DirichletMultinomialRV()
 
 
 class DirichletMultinomial(Discrete):
@@ -569,92 +596,16 @@ class DirichletMultinomial(Discrete):
         Describes shape of distribution. For example if n=array([5, 10]), and
         a=array([1, 1, 1]), shape should be (2, 3).
     """
+    rv_op = dirichlet_multinomial
 
-    def __init__(self, n, a, shape, *args, **kwargs):
-
-        super().__init__(shape=shape, defaults=("_defaultval",), *args, **kwargs)
-
+    @classmethod
+    def dist(cls, n, a, *args, **kwargs):
         n = intX(n)
         a = floatX(a)
-        if len(self.shape) > 1:
-            self.n = at.shape_padright(n)
-            self.a = at.as_tensor_variable(a) if a.ndim > 1 else at.shape_padleft(a)
-        else:
-            # n is a scalar, p is a 1d array
-            self.n = at.as_tensor_variable(n)
-            self.a = at.as_tensor_variable(a)
 
-        p = self.a / self.a.sum(-1, keepdims=True)
+        return super().dist([n, a], **kwargs)
 
-        self.mean = self.n * p
-        # Mode is only an approximation. Exact computation requires a complex
-        # iterative algorithm as described in https://doi.org/10.1016/j.spl.2009.09.013
-        mode = at.cast(at.round(self.mean), "int32")
-        diff = self.n - at.sum(mode, axis=-1, keepdims=True)
-        inc_bool_arr = at.abs_(diff) > 0
-        mode = at.inc_subtensor(mode[inc_bool_arr.nonzero()], diff[inc_bool_arr.nonzero()])
-        self._defaultval = mode
-
-    def _random(self, n, a, size=None):
-        # numpy will cast dirichlet and multinomial samples to float64 by default
-        original_dtype = a.dtype
-
-        # Thanks to the default shape handling done in generate_values, the last
-        # axis of n is a dummy axis that allows it to broadcast well with `a`
-        n = np.broadcast_to(n, size)
-        a = np.broadcast_to(a, size)
-        n = n[..., 0]
-
-        # np.random.multinomial needs `n` to be a scalar int and `a` a
-        # sequence so we semi flatten them and iterate over them
-        n_ = n.reshape([-1])
-        a_ = a.reshape([-1, a.shape[-1]])
-        p_ = np.array([np.random.dirichlet(aa) for aa in a_])
-        samples = np.array([np.random.multinomial(nn, pp) for nn, pp in zip(n_, p_)])
-        samples = samples.reshape(a.shape)
-
-        # We cast back to the original dtype
-        return samples.astype(original_dtype)
-
-    def random(self, point=None, size=None):
-        """
-        Draw random values from Dirichlet-Multinomial distribution.
-
-        Parameters
-        ----------
-        point: dict, optional
-            Dict of variable values on which random values are to be
-            conditioned (uses default point if not specified).
-        size: int, optional
-            Desired size of random sample (returns one sample if not
-            specified).
-
-        Returns
-        -------
-        array
-        """
-        # n, a = draw_values([self.n, self.a], point=point, size=size)
-        # samples = generate_samples(
-        #     self._random,
-        #     n,
-        #     a,
-        #     dist_shape=self.shape,
-        #     size=size,
-        # )
-        #
-        # # If distribution is initialized with .dist(), valid init shape is not asserted.
-        # # Under normal use in a model context valid init shape is asserted at start.
-        # expected_shape = to_tuple(size) + to_tuple(self.shape)
-        # sample_shape = tuple(samples.shape)
-        # if sample_shape != expected_shape:
-        #     raise ShapeError(
-        #         f"Expected sample shape was {expected_shape} but got {sample_shape}. "
-        #         "This may reflect an invalid initialization shape."
-        #     )
-        #
-        # return samples
-
-    def logp(self, value):
+    def logp(value, n, a):
         """
         Calculate log-probability of DirichletMultinomial distribution
         at specified value.
@@ -668,13 +619,16 @@ class DirichletMultinomial(Discrete):
         -------
         TensorVariable
         """
-        a = self.a
-        n = self.n
-        sum_a = a.sum(axis=-1, keepdims=True)
+        if value.ndim >= 1:
+            n = at.shape_padright(n)
+            if a.ndim > 1:
+                a = at.shape_padleft(a)
 
+        sum_a = a.sum(axis=-1, keepdims=True)
         const = (gammaln(n + 1) + gammaln(sum_a)) - gammaln(n + sum_a)
         series = gammaln(value + a) - (gammaln(value + 1) + gammaln(a))
         result = const + series.sum(axis=-1, keepdims=True)
+
         # Bounds checking to confirm parameters and data meet all constraints
         # and that each observation value_i sums to n_i.
         return bound(
@@ -688,6 +642,122 @@ class DirichletMultinomial(Discrete):
 
     def _distr_parameters_for_repr(self):
         return ["n", "a"]
+
+
+class _OrderedMultinomial(Multinomial):
+    r"""
+    Underlying class for ordered multinomial distributions.
+    See docs for the OrderedMultinomial wrapper class for more details on how to use it in models.
+    """
+    rv_op = multinomial
+
+    @classmethod
+    def dist(cls, eta, cutpoints, n, *args, **kwargs):
+        eta = at.as_tensor_variable(floatX(eta))
+        cutpoints = at.as_tensor_variable(cutpoints)
+        n = at.as_tensor_variable(intX(n))
+
+        pa = sigmoid(cutpoints - at.shape_padright(eta))
+        p_cum = at.concatenate(
+            [
+                at.zeros_like(at.shape_padright(pa[..., 0])),
+                pa,
+                at.ones_like(at.shape_padright(pa[..., 0])),
+            ],
+            axis=-1,
+        )
+        p = p_cum[..., 1:] - p_cum[..., :-1]
+
+        return super().dist(n, p, *args, **kwargs)
+
+
+class OrderedMultinomial:
+    R"""
+    Wrapper class for Ordered Multinomial distributions.
+
+    Useful for regression on ordinal data whose values range
+    from 1 to K as a function of some predictor, :math:`\eta`, but
+     which are _aggregated_ by trial, like multinomial observations (in
+     contrast to `pm.OrderedLogistic`, which only accepts ordinal data
+     in a _disaggregated_ format, like categorical observations).
+     The cutpoints, :math:`c`, separate which ranges of :math:`\eta` are
+    mapped to which of the K observed dependent variables. The number
+    of cutpoints is K - 1. It is recommended that the cutpoints are
+    constrained to be ordered.
+
+    .. math::
+
+       f(k \mid \eta, c) = \left\{
+         \begin{array}{l}
+           1 - \text{logit}^{-1}(\eta - c_1)
+             \,, \text{if } k = 0 \\
+           \text{logit}^{-1}(\eta - c_{k - 1}) -
+           \text{logit}^{-1}(\eta - c_{k})
+             \,, \text{if } 0 < k < K \\
+           \text{logit}^{-1}(\eta - c_{K - 1})
+             \,, \text{if } k = K \\
+         \end{array}
+       \right.
+
+    Parameters
+    ----------
+    eta: float
+        The predictor.
+    cutpoints: array
+        The length K - 1 array of cutpoints which break :math:`\eta` into
+        ranges. Do not explicitly set the first and last elements of
+        :math:`c` to negative and positive infinity.
+    n: int
+        The total number of multinomial trials.
+    compute_p: boolean, default True
+        Whether to compute and store in the trace the inferred probabilities of each
+        categories,
+        based on the cutpoints' values. Defaults to True.
+        Might be useful to disable it if memory usage is of interest.
+
+    Examples
+    --------
+
+    .. code-block:: python
+
+        # Generate data for a simple 1 dimensional example problem
+        true_cum_p = np.array([0.1, 0.15, 0.25, 0.50, 0.65, 0.90, 1.0])
+        true_p = np.hstack([true_cum_p[0], true_cum_p[1:] - true_cum_p[:-1]])
+        fake_elections = np.random.multinomial(n=1_000, pvals=true_p, size=60)
+
+        # Ordered multinomial regression
+        with pm.Model() as model:
+            cutpoints = pm.Normal(
+                "cutpoints",
+                mu=np.arange(6) - 2.5,
+                sigma=1.5,
+                initval=np.arange(6) - 2.5,
+                transform=pm.distributions.transforms.ordered,
+            )
+
+            pm.OrderedMultinomial(
+                "results",
+                eta=0.0,
+                cutpoints=cutpoints,
+                n=fake_elections.sum(1),
+                observed=fake_elections,
+            )
+
+            trace = pm.sample()
+
+        # Plot the results
+        arviz.plot_posterior(trace_12_4, var_names=["complete_p"], ref_val=list(true_p));
+    """
+
+    def __new__(cls, name, *args, compute_p=True, **kwargs):
+        out_rv = _OrderedMultinomial(name, *args, **kwargs)
+        if compute_p:
+            pm.Deterministic(f"{name}_probs", out_rv.owner.inputs[4])
+        return out_rv
+
+    @classmethod
+    def dist(cls, *args, **kwargs):
+        return _OrderedMultinomial.dist(*args, **kwargs)
 
 
 def posdef(AA):
@@ -855,7 +925,7 @@ class Wishart(Continuous):
 
 
 def WishartBartlett(name, S, nu, is_cholesky=False, return_cholesky=False, initval=None):
-    R"""
+    r"""
     Bartlett decomposition of the Wishart distribution. As the Wishart
     distribution requires the matrix to be symmetric positive semi-definite
     it is impossible for MCMC to ever propose acceptable matrices.
@@ -1455,6 +1525,10 @@ class MatrixNormalRV(RandomVariable):
     dtype = "floatX"
     _print_name = ("MatrixNormal", "\\operatorname{MatrixNormal}")
 
+    def _infer_shape(self, size, dist_params, param_shapes=None):
+        shape = tuple(size) + tuple(dist_params[0].shape)
+        return shape
+
     @classmethod
     def rng_fn(cls, rng, mu, rowchol, colchol, size=None):
 
@@ -1526,7 +1600,7 @@ class MatrixNormal(Continuous):
         n = colcov.shape[0]
         mu = np.zeros((m, n))
         vals = pm.MatrixNormal('vals', mu=mu, colcov=colcov,
-                               rowcov=rowcov, shape=(m, n))
+                               rowcov=rowcov)
 
     Above, the ith row in vals has a variance that is scaled by 4^i.
     Alternatively, row or column cholesky matrices could be substituted for
@@ -1560,11 +1634,11 @@ class MatrixNormal(Continuous):
             colchol = pm.expand_packed_triangular(3, colchol_packed)
 
             # Setup left covariance matrix
-            scale = pm.Lognormal('scale', mu=np.log(true_scale), sigma=0.5)
+            scale = pm.LogNormal('scale', mu=np.log(true_scale), sigma=0.5)
             rowcov = at.diag([scale**(2*i) for i in range(m)])
 
             vals = pm.MatrixNormal('vals', mu=mu, colchol=colchol, rowcov=rowcov,
-                                   observed=data, shape=(m, n))
+                                   observed=data)
     """
     rv_op = matrixnormal
 
@@ -1576,16 +1650,22 @@ class MatrixNormal(Continuous):
         rowchol=None,
         colcov=None,
         colchol=None,
-        shape=None,
         *args,
         **kwargs,
     ):
 
         cholesky = Cholesky(lower=True, on_error="raise")
 
-        if mu.ndim == 1:
-            raise ValueError(
-                "1x1 Matrix was provided. Please use Normal distribution for such cases."
+        if kwargs.get("size", None) is not None:
+            raise NotImplementedError("MatrixNormal doesn't support size argument")
+
+        if "shape" in kwargs:
+            kwargs.pop("shape")
+            warnings.warn(
+                "The shape argument in MatrixNormal is deprecated and will be ignored."
+                "MatrixNormal automatically derives the shape"
+                "from row and column matrix dimensions.",
+                DeprecationWarning,
             )
 
         # Among-row matrices
@@ -1617,6 +1697,11 @@ class MatrixNormal(Continuous):
                 raise ValueError("colchol must be two dimensional.")
             colchol_cov = at.as_tensor_variable(colchol)
 
+        dist_shape = (rowchol_cov.shape[0], colchol_cov.shape[0])
+
+        # Broadcasting mu
+        mu = at.extra_ops.broadcast_to(a=mu, shape=dist_shape)
+
         mu = at.as_tensor_variable(floatX(mu))
         # mean = median = mode = mu
 
@@ -1637,15 +1722,18 @@ class MatrixNormal(Continuous):
         TensorVariable
         """
 
+        if value.ndim != 2:
+            raise ValueError("Value must be two dimensional.")
+
         # Compute Tr[colcov^-1 @ (x - mu).T @ rowcov^-1 @ (x - mu)] and
         # the logdet of colcov and rowcov.
         delta = value - mu
 
         # Find exponent piece by piece
-        right_quaddist = solve_lower_triangular(rowchol, delta)
+        right_quaddist = solve_lower(rowchol, delta)
         quaddist = at.nlinalg.matrix_dot(right_quaddist.T, right_quaddist)
-        quaddist = solve_lower_triangular(colchol, quaddist)
-        quaddist = solve_upper_triangular(colchol.T, quaddist)
+        quaddist = solve_lower(colchol, quaddist)
+        quaddist = solve_upper(colchol.T, quaddist)
         trquaddist = at.nlinalg.trace(quaddist)
 
         coldiag = at.diag(colchol)
@@ -1855,6 +1943,81 @@ class KroneckerNormal(Continuous):
         return ["mu"]
 
 
+class CARRV(RandomVariable):
+    name = "car"
+    ndim_supp = 1
+    ndims_params = [1, 2, 0, 0]
+    dtype = "floatX"
+    _print_name = ("CAR", "\\operatorname{CAR}")
+
+    def make_node(self, rng, size, dtype, mu, W, alpha, tau):
+        mu = at.as_tensor_variable(floatX(mu))
+
+        W = aesara.sparse.as_sparse_or_tensor_variable(floatX(W))
+        if not W.ndim == 2:
+            raise ValueError("W must be a matrix (ndim=2).")
+
+        sparse = isinstance(W, aesara.sparse.SparseVariable)
+        msg = "W must be a symmetric adjacency matrix."
+        if sparse:
+            abs_diff = aesara.sparse.basic.mul(aesara.sparse.basic.sgn(W - W.T), W - W.T)
+            W = Assert(msg)(W, at.isclose(aesara.sparse.basic.sp_sum(abs_diff), 0))
+        else:
+            W = Assert(msg)(W, at.allclose(W, W.T))
+
+        tau = at.as_tensor_variable(floatX(tau))
+        alpha = at.as_tensor_variable(floatX(alpha))
+
+        return super().make_node(rng, size, dtype, mu, W, alpha, tau)
+
+    def _infer_shape(self, size, dist_params, param_shapes=None):
+        shape = tuple(size) + tuple(dist_params[0].shape)
+        return shape
+
+    @classmethod
+    def rng_fn(cls, rng: np.random.RandomState, mu, W, alpha, tau, size):
+        """
+        Implementation of algorithm from paper
+        Havard Rue, 2001. "Fast sampling of Gaussian Markov random fields,"
+        Journal of the Royal Statistical Society Series B, Royal Statistical Society,
+        vol. 63(2), pages 325-338. DOI: 10.1111/1467-9868.00288
+        """
+        if not scipy.sparse.issparse(W):
+            W = scipy.sparse.csr_matrix(W)
+        s = np.asarray(W.sum(axis=0))[0]
+        D = scipy.sparse.diags(s)
+        tau = scipy.sparse.csr_matrix(tau)
+        alpha = scipy.sparse.csr_matrix(alpha)
+
+        Q = tau.multiply(D - alpha.multiply(W))
+
+        perm_array = scipy.sparse.csgraph.reverse_cuthill_mckee(Q, symmetric_mode=True)
+        inv_perm = np.argsort(perm_array)
+
+        Q = Q[perm_array, :][:, perm_array]
+
+        Qb = Q.diagonal()
+        u = 1
+        while np.count_nonzero(Q.diagonal(u)) > 0:
+            Qb = np.vstack((np.pad(Q.diagonal(u), (u, 0), constant_values=(0, 0)), Qb))
+            u += 1
+
+        L = scipy.linalg.cholesky_banded(Qb, lower=False)
+
+        size = tuple(size or ())
+        if size:
+            mu = np.broadcast_to(mu, size + mu.shape)
+        z = rng.normal(size=mu.shape)
+        samples = np.empty(z.shape)
+        for idx in np.ndindex(mu.shape[:-1]):
+            samples[idx] = scipy.linalg.cho_solve_banded((L, False), z[idx]) + mu[idx][perm_array]
+        samples = samples[..., inv_perm]
+        return samples
+
+
+car = CARRV()
+
+
 class CAR(Continuous):
     r"""
     Likelihood for a conditional autoregression. This is a special case of the
@@ -1896,45 +2059,13 @@ class CAR(Continuous):
         "Generalized Hierarchical Multivariate CAR Models for Areal Data"
         Biometrics, Vol. 61, No. 4 (Dec., 2005), pp. 950-961
     """
+    rv_op = car
 
-    def __init__(self, mu, W, alpha, tau, sparse=False, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    @classmethod
+    def dist(cls, mu, W, alpha, tau, *args, **kwargs):
+        return super().dist([mu, W, alpha, tau], **kwargs)
 
-        D = W.sum(axis=0)
-        d, _ = W.shape
-
-        self.d = d
-        self.median = self.mode = self.mean = self.mu = at.as_tensor_variable(mu)
-        self.sparse = sparse
-
-        if not W.ndim == 2 or not np.allclose(W, W.T):
-            raise ValueError("W must be a symmetric adjacency matrix.")
-
-        if sparse:
-            W_sparse = scipy.sparse.csr_matrix(W)
-            self.W = aesara.sparse.as_sparse_variable(W_sparse)
-        else:
-            self.W = at.as_tensor_variable(W)
-
-        # eigenvalues of D^−1/2 * W * D^−1/2
-        Dinv_sqrt = np.diag(1 / np.sqrt(D))
-        DWD = np.matmul(np.matmul(Dinv_sqrt, W), Dinv_sqrt)
-        self.lam = scipy.linalg.eigvalsh(DWD)
-        self.D = at.as_tensor_variable(D)
-
-        tau = at.as_tensor_variable(tau)
-        if tau.ndim > 0:
-            self.tau = tau[:, None]
-        else:
-            self.tau = tau
-
-        alpha = at.as_tensor_variable(alpha)
-        if alpha.ndim > 0:
-            self.alpha = alpha[:, None]
-        else:
-            self.alpha = alpha
-
-    def logp(self, value):
+    def logp(value, mu, W, alpha, tau):
         """
         Calculate log-probability of a CAR-distributed vector
         at specified value. This log probability function differs from
@@ -1951,30 +2082,37 @@ class CAR(Continuous):
         TensorVariable
         """
 
+        sparse = isinstance(W, aesara.sparse.SparseVariable)
+
+        if sparse:
+            D = sp_sum(W, axis=0)
+            Dinv_sqrt = at.diag(1 / at.sqrt(D))
+            DWD = at.dot(aesara.sparse.dot(Dinv_sqrt, W), Dinv_sqrt)
+        else:
+            D = W.sum(axis=0)
+            Dinv_sqrt = at.diag(1 / at.sqrt(D))
+            DWD = at.dot(at.dot(Dinv_sqrt, W), Dinv_sqrt)
+        lam = at.slinalg.eigvalsh(DWD, at.eye(DWD.shape[0]))
+
+        d, _ = W.shape
+
         if value.ndim == 1:
             value = value[None, :]
 
-        logtau = self.d * at.log(self.tau).sum()
-        logdet = at.log(1 - self.alpha.T * self.lam[:, None]).sum()
-        delta = value - self.mu
+        logtau = d * at.log(tau).sum()
+        logdet = at.log(1 - alpha.T * lam[:, None]).sum()
+        delta = value - mu
 
-        if self.sparse:
-            Wdelta = aesara.sparse.dot(delta, self.W)
+        if sparse:
+            Wdelta = aesara.sparse.dot(delta, W)
         else:
-            Wdelta = at.dot(delta, self.W)
+            Wdelta = at.dot(delta, W)
 
-        tau_dot_delta = self.D[None, :] * delta - self.alpha * Wdelta
-        logquad = (self.tau * delta * tau_dot_delta).sum(axis=-1)
+        tau_dot_delta = D[None, :] * delta - alpha * Wdelta
+        logquad = (tau * delta * tau_dot_delta).sum(axis=-1)
         return bound(
             0.5 * (logtau + logdet - logquad),
-            self.alpha >= -1,
-            self.alpha <= 1,
-            self.tau > 0,
-            broadcast_conditions=False,
+            at.all(alpha <= 1),
+            at.all(alpha >= -1),
+            tau > 0,
         )
-
-    def random(self, point=None, size=None):
-        raise NotImplementedError("Sampling from a CAR distribution is not supported.")
-
-    def _distr_parameters_for_repr(self):
-        return ["mu", "W", "alpha", "tau"]

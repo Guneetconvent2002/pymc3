@@ -30,6 +30,7 @@ jobs:
         # → pytest will run only these files
           - |
             --ignore=pymc3/tests/test_distributions_timeseries.py
+            --ignore=pymc3/tests/test_initvals.py
             --ignore=pymc3/tests/test_mixture.py
             --ignore=pymc3/tests/test_model_graph.py
             --ignore=pymc3/tests/test_modelcontext.py
@@ -60,8 +61,11 @@ jobs:
             --ignore=pymc3/tests/test_distributions_random.py
             --ignore=pymc3/tests/test_idata_conversion.py
 
-          - pymc3/tests/test_distributions.py
           - pymc3/tests/test_variational_inference.py
+
+          - |
+            pymc3/tests/test_initvals.py
+            pymc3/tests/test_distributions.py
 
           - |
             pymc3/tests/test_modelcontext.py
@@ -135,6 +139,7 @@ jobs:
         run: |
           conda activate pymc3-dev-py37
           pip install -e .
+          pip install --pre -U polyagamma
           python --version
       - name: Run tests
         run: |
@@ -154,6 +159,7 @@ jobs:
         test-subset:
           - pymc3/tests/test_variational_inference.py
           - |
+            pymc3/tests/test_initvals.py
             pymc3/tests/test_distributions_random.py
             pymc3/tests/test_distributions_timeseries.py
           - |
@@ -213,6 +219,7 @@ jobs:
         run: |
           conda activate pymc3-dev-py38
           pip install -e .
+          pip install --pre -U polyagamma
           python --version
       - name: Run tests
         # This job uses a cmd shell, therefore the environment variable syntax is different!

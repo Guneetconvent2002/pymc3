@@ -18,7 +18,7 @@ import numpy as np
 
 from pymc3.aesaraf import floatX
 from pymc3.backends.report import SamplerWarning, WarningType
-from pymc3.distributions import BART
+from pymc3.distributions.bart import BARTRV
 from pymc3.math import logbern, logdiffexp_numpy
 from pymc3.step_methods.arraystep import Competence
 from pymc3.step_methods.hmc.base_hmc import BaseHMC, DivergenceInfo, HMCStepData
@@ -114,7 +114,9 @@ class NUTS(BaseHMC):
 
         Parameters
         ----------
-        vars: list of Aesara variables, default all continuous vars
+        vars: list, default=None
+            List of Aesara variables. If None, all continuous RVs from the
+            model are included.
         Emax: float, default 1000
             Maximum energy change allowed during leapfrog steps. Larger
             deviations will abort the integration.
@@ -196,8 +198,9 @@ class NUTS(BaseHMC):
     @staticmethod
     def competence(var, has_grad):
         """Check how appropriate this class is for sampling a random variable."""
+
         dist = getattr(var.owner, "op", None)
-        if var.dtype in continuous_types and has_grad and not isinstance(dist, BART):
+        if var.dtype in continuous_types and has_grad and not isinstance(dist, BARTRV):
             return Competence.IDEAL
         return Competence.INCOMPATIBLE
 
@@ -357,7 +360,7 @@ class _Tree:
                 )
                 return tree, None, False
             else:
-                error_msg = "Energy change in leapfrog step is too large: %s." % energy_change
+                error_msg = f"Energy change in leapfrog step is too large: {energy_change}."
                 error = None
         tree = Subtree(None, None, None, None, -np.inf, -np.inf, 1)
         divergance_info = DivergenceInfo(error_msg, error, left, right)

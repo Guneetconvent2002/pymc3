@@ -26,6 +26,7 @@ from copy import copy, deepcopy
 from typing import Any, Dict, Iterable, List, Optional, Set, Union, cast
 
 import aesara.gradient as tg
+import cloudpickle
 import numpy as np
 import xarray
 
@@ -41,6 +42,7 @@ from pymc3.backends.arviz import _DefaultTrace
 from pymc3.backends.base import BaseTrace, MultiTrace
 from pymc3.backends.ndarray import NDArray
 from pymc3.blocking import DictToArrayBijection
+from pymc3.distributions import NoDistribution
 from pymc3.exceptions import IncorrectArgumentsError, SamplingError
 from pymc3.model import Model, Point, modelcontext
 from pymc3.parallel_sampling import Draw, _cpu_count
@@ -231,13 +233,17 @@ def _print_step_hierarchy(s: Step, level=0) -> None:
         _log.info(">" * level + f"{s.__class__.__name__}: [{varnames}]")
 
 
-def all_continuous(vars):
+def all_continuous(vars, model):
     """Check that vars not include discrete variables or BART variables, excepting observed RVs."""
 
     vars_ = [var for var in vars if not (var.owner and hasattr(var.tag, "observations"))]
+
     if any(
         [
-            (var.dtype in discrete_types or (var.owner and isinstance(var.owner.op, pm.BART)))
+            (
+                var.dtype in discrete_types
+                or isinstance(model.values_to_rvs[var].owner.op, NoDistribution)
+            )
             for var in vars_
         ]
     ):
@@ -268,7 +274,6 @@ def sample(
     return_inferencedata=None,
     idata_kwargs: dict = None,
     mp_ctx=None,
-    pickle_backend: str = "pickle",
     **kwargs,
 ):
     r"""Draw samples from the posterior using the given step methods.
@@ -337,6 +342,7 @@ def sample(
         of completion, the sampling speed in samples per second (SPS), and the estimated remaining
         time until completion ("expected time of arrival"; ETA).
     model : Model (optional if in ``with`` context)
+        Model to sample from. The model needs to have free random variables.
     random_seed : int or list of ints
         Random seed(s) used by the sampling steps.  A list is accepted if
         ``cores`` is greater than one.
@@ -362,10 +368,6 @@ def sample(
     mp_ctx : multiprocessing.context.BaseContent
         A multiprocessing context for parallel sampling. See multiprocessing
         documentation for details.
-    pickle_backend : str
-        One of `'pickle'` or `'dill'`. The library used to pickle models
-        in parallel sampling if the multiprocessing context is not of type
-        `fork`.
 
     Returns
     -------
@@ -385,7 +387,8 @@ def sample(
           work better for problematic posteriors
         * max_treedepth : The maximum depth of the trajectory tree
         * step_scale : float, default 0.25
-          The initial guess for the step size scaled down by :math:`1/n**(1/4)`
+          The initial guess for the step size scaled down by :math:`1/n**(1/4)`,
+          where n is the dimensionality of the parameter space
 
     If your model uses multiple step methods, aka a Compound Step, then you have
     two ways to address arguments to each step method:
@@ -438,6 +441,11 @@ def sample(
         p  0.609  0.047   0.528    0.699
     """
     model = modelcontext(model)
+    if not model.free_RVs:
+        raise SamplingError(
+            "Cannot sample from the model, since the model does not contain any free variables."
+        )
+
     start = deepcopy(start)
     model_initial_point = model.initial_point
     if start is None:
@@ -496,10 +504,7 @@ def sample(
 
     draws += tune
 
-    if not model.free_RVs:
-        raise ValueError("The model does not contain any free variables.")
-
-    if step is None and init is not None and all_continuous(model.value_vars):
+    if step is None and init is not None and all_continuous(model.value_vars, model):
         try:
             # By default, try to use NUTS
             _log.info("Auto-assigning NUTS sampler...")
@@ -548,7 +553,6 @@ def sample(
         "discard_tuned_samples": discard_tuned_samples,
     }
     parallel_args = {
-        "pickle_backend": pickle_backend,
         "mp_ctx": mp_ctx,
     }
 
@@ -636,8 +640,13 @@ def sample(
     trace.report._t_sampling = t_sampling
 
     if "variable_inclusion" in trace.stat_names:
-        variable_inclusion = np.stack(trace.get_sampler_stats("variable_inclusion")).mean(0)
-        trace.report.variable_importance = variable_inclusion / variable_inclusion.sum()
+        for strace in trace._straces.values():
+            for stat in strace._stats:
+                if "variable_inclusion" in stat:
+                    if trace.nchains > 1:
+                        stat["variable_inclusion"] = np.vstack(stat["variable_inclusion"])
+                    else:
+                        stat["variable_inclusion"] = [np.vstack(stat["variable_inclusion"])]
 
     n_chains = len(trace.chains)
     _log.info(
@@ -1100,7 +1109,7 @@ class PopulationStepper:
                     enumerate(progress_bar(steppers)) if progressbar else enumerate(steppers)
                 ):
                     secondary_end, primary_end = multiprocessing.Pipe()
-                    stepper_dumps = pickle.dumps(stepper, protocol=4)
+                    stepper_dumps = cloudpickle.dumps(stepper, protocol=4)
                     process = multiprocessing.Process(
                         target=self.__class__._run_secondary,
                         args=(c, stepper_dumps, secondary_end),
@@ -1159,7 +1168,7 @@ class PopulationStepper:
         # re-seed each child process to make them unique
         np.random.seed(None)
         try:
-            stepper = pickle.loads(stepper_dumps)
+            stepper = cloudpickle.loads(stepper_dumps)
             # the stepper is not necessarily a PopulationArraySharedStep itself,
             # but rather a CompoundStep. PopulationArrayStepShared.population
             # has to be updated, therefore we identify the substeppers first.
@@ -1418,7 +1427,6 @@ def _mp_sample(
     callback=None,
     discard_tuned_samples=True,
     mp_ctx=None,
-    pickle_backend="pickle",
     **kwargs,
 ):
     """Main iteration for multiprocess sampling.
@@ -1491,7 +1499,6 @@ def _mp_sample(
         chain,
         progressbar,
         mp_ctx=mp_ctx,
-        pickle_backend=pickle_backend,
     )
     try:
         try:
@@ -2131,7 +2138,7 @@ def init_nuts(
     vars = kwargs.get("vars", model.value_vars)
     if set(vars) != set(model.value_vars):
         raise ValueError("Must use init_nuts on all variables of a model.")
-    if not all_continuous(vars):
+    if not all_continuous(vars, model):
         raise ValueError("init_nuts can only be used for models with only " "continuous variables.")
 
     if not isinstance(init, str):

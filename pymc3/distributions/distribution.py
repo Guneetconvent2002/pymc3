@@ -12,21 +12,22 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 import contextvars
-import inspect
+import functools
 import multiprocessing
 import sys
 import types
 import warnings
 
 from abc import ABCMeta
+from functools import singledispatch
 from typing import Optional
 
 import aesara
 import aesara.tensor as at
-import dill
 
 from aesara.tensor.random.op import RandomVariable
 from aesara.tensor.random.var import RandomStateSharedVariable
+from aesara.tensor.var import TensorVariable
 
 from pymc3.aesaraf import change_rv_size
 from pymc3.distributions import _logcdf, _logp
@@ -42,7 +43,8 @@ from pymc3.distributions.shape_utils import (
     resize_from_dims,
     resize_from_observed,
 )
-from pymc3.util import UNSET, get_repr_for_variable
+from pymc3.printing import str_for_dist
+from pymc3.util import UNSET
 from pymc3.vartypes import string_types
 
 __all__ = [
@@ -106,6 +108,13 @@ class DistributionMeta(ABCMeta):
                 def logcdf(op, var, rvs_to_values, *dist_params, **kwargs):
                     value_var = rvs_to_values.get(var, var)
                     return class_logcdf(value_var, *dist_params, **kwargs)
+
+            class_initval = clsdict.get("get_moment")
+            if class_initval:
+
+                @_get_moment.register(rv_type)
+                def get_moment(op, rv, size, *rv_inputs):
+                    return class_initval(rv, size, *rv_inputs)
 
             # Register the Aesara `RandomVariable` type as a subclass of this
             # `Distribution` type.
@@ -202,9 +211,9 @@ class Distribution(metaclass=DistributionMeta):
             )
         dims = convert_dims(dims)
 
-        # Create the RV without specifying initval, because the initval may have a shape
-        # that only matches after replicating with a size implied by dims (see below).
-        rv_out = cls.dist(*args, rng=rng, initval=None, **kwargs)
+        # Create the RV without dims information, because that's not something tracked at the Aesara level.
+        # If necessary we'll later replicate to a different size implied by already known dims.
+        rv_out = cls.dist(*args, rng=rng, **kwargs)
         ndim_actual = rv_out.ndim
         resize_shape = None
 
@@ -219,11 +228,23 @@ class Distribution(metaclass=DistributionMeta):
             # A batch size was specified through `dims`, or implied by `observed`.
             rv_out = change_rv_size(rv_var=rv_out, new_size=resize_shape, expand=True)
 
-        if initval is not None:
-            # Assigning the testval earlier causes trouble because the RV may not be created with the final shape already.
-            rv_out.tag.test_value = initval
+        rv_out = model.register_rv(
+            rv_out,
+            name,
+            observed,
+            total_size,
+            dims=dims,
+            transform=transform,
+            initval=initval,
+        )
 
-        return model.register_rv(rv_out, name, observed, total_size, dims=dims, transform=transform)
+        # add in pretty-printing support
+        rv_out.str_repr = types.MethodType(str_for_dist, rv_out)
+        rv_out._repr_latex_ = types.MethodType(
+            functools.partial(str_for_dist, formatting="latex"), rv_out
+        )
+
+        return rv_out
 
     @classmethod
     def dist(
@@ -232,7 +253,6 @@ class Distribution(metaclass=DistributionMeta):
         *,
         shape: Optional[Shape] = None,
         size: Optional[Size] = None,
-        initval=None,
         **kwargs,
     ) -> RandomVariable:
         """Creates a RandomVariable corresponding to the `cls` distribution.
@@ -248,9 +268,6 @@ class Distribution(metaclass=DistributionMeta):
             all the dimensions that the RV would get if no shape/size/dims were passed at all.
         size : int, tuple, Variable, optional
             For creating the RV like in Aesara/NumPy.
-        initival : optional
-            Test value to be attached to the output RV.
-            Must match its shape exactly.
 
         Returns
         -------
@@ -258,15 +275,20 @@ class Distribution(metaclass=DistributionMeta):
             The created RV.
         """
         if "testval" in kwargs:
-            initval = kwargs.pop("testval")
+            kwargs.pop("testval")
             warnings.warn(
-                "The `testval` argument is deprecated. "
-                "Use `initval` to set initial values for a `Model`; "
-                "otherwise, set test values on Aesara parameters explicitly "
-                "when attempting to use Aesara's test value debugging features.",
+                "The `.dist(testval=...)` argument is deprecated and has no effect. "
+                "Initial values for sampling/optimization can be specified with `initval` in a modelcontext. "
+                "For using Aesara's test value features, you must assign the `.tag.test_value` yourself.",
                 DeprecationWarning,
                 stacklevel=2,
             )
+        if "initval" in kwargs:
+            raise TypeError(
+                "Unexpected keyword argument `initval`. "
+                "This argument is not available for the `.dist()` API."
+            )
+
         if "dims" in kwargs:
             raise NotImplementedError("The use of a `.dist(dims=...)` API is not supported.")
         if shape is not None and size is not None:
@@ -314,76 +336,21 @@ class Distribution(metaclass=DistributionMeta):
 
         return rv_out
 
-    def _distr_parameters_for_repr(self):
-        """Return the names of the parameters for this distribution (e.g. "mu"
-        and "sigma" for Normal). Used in generating string (and LaTeX etc.)
-        representations of Distribution objects. By default based on inspection
-        of __init__, but can be overwritten if necessary (e.g. to avoid including
-        "sd" and "tau").
-        """
-        return inspect.getfullargspec(self.__init__).args[1:]
 
-    def _distr_name_for_repr(self):
-        return self.__class__.__name__
+@singledispatch
+def _get_moment(op, rv, size, *rv_inputs) -> TensorVariable:
+    return None
 
-    def _str_repr(self, name=None, dist=None, formatting="plain"):
-        """
-        Generate string representation for this distribution, optionally
-        including LaTeX markup (formatting='latex').
 
-        Parameters
-        ----------
-        name : str
-            name of the distribution
-        dist : Distribution
-            the distribution object
-        formatting : str
-            one of { "latex", "plain", "latex_with_params", "plain_with_params" }
-        """
-        if dist is None:
-            dist = self
-        if name is None:
-            name = "[unnamed]"
-        supported_formattings = {"latex", "plain", "latex_with_params", "plain_with_params"}
-        if not formatting in supported_formattings:
-            raise ValueError(f"Unsupported formatting ''. Choose one of {supported_formattings}.")
+def get_moment(rv: TensorVariable) -> TensorVariable:
+    """Method for choosing a representative point/value
+    that can be used to start optimization or MCMC sampling.
 
-        param_names = self._distr_parameters_for_repr()
-        param_values = [
-            get_repr_for_variable(getattr(dist, x), formatting=formatting) for x in param_names
-        ]
-
-        if "latex" in formatting:
-            param_string = ",~".join(
-                [fr"\mathit{{{name}}}={value}" for name, value in zip(param_names, param_values)]
-            )
-            if formatting == "latex_with_params":
-                return r"$\text{{{var_name}}} \sim \text{{{distr_name}}}({params})$".format(
-                    var_name=name, distr_name=dist._distr_name_for_repr(), params=param_string
-                )
-            return r"$\text{{{var_name}}} \sim \text{{{distr_name}}}$".format(
-                var_name=name, distr_name=dist._distr_name_for_repr()
-            )
-        else:
-            # one of the plain formattings
-            param_string = ", ".join(
-                [f"{name}={value}" for name, value in zip(param_names, param_values)]
-            )
-            if formatting == "plain_with_params":
-                return f"{name} ~ {dist._distr_name_for_repr()}({param_string})"
-            return f"{name} ~ {dist._distr_name_for_repr()}"
-
-    def __str__(self, **kwargs):
-        try:
-            return self._str_repr(formatting="plain", **kwargs)
-        except:
-            return super().__str__()
-
-    def _repr_latex_(self, *, formatting="latex_with_params", **kwargs):
-        """Magic method name for IPython to use for LaTeX formatting."""
-        return self._str_repr(formatting=formatting, **kwargs)
-
-    __latex__ = _repr_latex_
+    The only parameter to this function is the RandomVariable
+    for which the value is to be derived.
+    """
+    size = rv.owner.inputs[1]
+    return _get_moment(rv.owner.op, rv, size, *rv.owner.inputs[3:])
 
 
 class NoDistribution(Distribution):
@@ -532,27 +499,6 @@ class DensityDist(Distribution):
         self.rand = random
         self.wrap_random_with_dist_shape = wrap_random_with_dist_shape
         self.check_shape_in_random = check_shape_in_random
-
-    def __getstate__(self):
-        # We use dill to serialize the logp function, as this is almost
-        # always defined in the notebook and won't be pickled correctly.
-        # Fix https://github.com/pymc-devs/pymc3/issues/3844
-        try:
-            logp = dill.dumps(self.logp)
-        except RecursionError as err:
-            if type(self.logp) == types.MethodType:
-                raise ValueError(
-                    "logp for DensityDist is a bound method, leading to RecursionError while serializing"
-                ) from err
-            else:
-                raise err
-        vals = self.__dict__.copy()
-        vals["logp"] = logp
-        return vals
-
-    def __setstate__(self, vals):
-        vals["logp"] = dill.loads(vals["logp"])
-        self.__dict__ = vals
 
     def _distr_parameters_for_repr(self):
         return []

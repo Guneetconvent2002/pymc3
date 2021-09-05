@@ -24,7 +24,7 @@ Continuous
    Gamma
    InverseGamma
    Weibull
-   Lognormal
+   LogNormal
    ChiSquared
    Wald
    Pareto
@@ -36,6 +36,7 @@ Continuous
    Logistic
    LogitNormal
    Interpolated
+   PolyaGamma
 
 .. automodule:: pymc3.distributions.continuous
    :members:

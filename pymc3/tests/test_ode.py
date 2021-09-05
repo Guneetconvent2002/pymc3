@@ -173,7 +173,7 @@ class TestSensitivityInitialCondition:
         np.testing.assert_array_equal(np.ravel(model5_sens_ic), model5._sens_ic)
 
 
-@pytest.mark.xfail(reason="https://github.com/pymc-devs/aesara/issues/390")
+@pytest.mark.xfail(condition=IS_WINDOWS, reason="https://github.com/pymc-devs/aesara/issues/390")
 def test_logp_scalar_ode():
     """Test the computation of the log probability for these models"""
 
@@ -270,7 +270,9 @@ class TestDiffEqModel:
         assert op_1 != op_other
         return
 
-    @pytest.mark.xfail(reason="https://github.com/pymc-devs/aesara/issues/390")
+    @pytest.mark.xfail(
+        condition=IS_WINDOWS, reason="https://github.com/pymc-devs/aesara/issues/390"
+    )
     def test_scalar_ode_1_param(self):
         """Test running model for a scalar ODE with 1 parameter"""
 
@@ -289,17 +291,19 @@ class TestDiffEqModel:
 
         with pm.Model() as model:
             alpha = pm.HalfCauchy("alpha", 1)
-            y0 = pm.Lognormal("y0", 0, 1)
+            y0 = pm.LogNormal("y0", 0, 1)
             sigma = pm.HalfCauchy("sigma", 1)
             forward = ode_model(theta=[alpha], y0=[y0])
-            y = pm.Lognormal("y", mu=pm.math.log(forward), sd=sigma, observed=yobs)
+            y = pm.LogNormal("y", mu=pm.math.log(forward), sd=sigma, observed=yobs)
             idata = pm.sample(100, tune=0, chains=1)
 
         assert idata.posterior["alpha"].shape == (1, 100)
         assert idata.posterior["y0"].shape == (1, 100)
         assert idata.posterior["sigma"].shape == (1, 100)
 
-    @pytest.mark.xfail(reason="https://github.com/pymc-devs/aesara/issues/390")
+    @pytest.mark.xfail(
+        condition=IS_WINDOWS, reason="https://github.com/pymc-devs/aesara/issues/390"
+    )
     def test_scalar_ode_2_param(self):
         """Test running model for a scalar ODE with 2 parameters"""
 
@@ -319,10 +323,10 @@ class TestDiffEqModel:
         with pm.Model() as model:
             alpha = pm.HalfCauchy("alpha", 1)
             beta = pm.HalfCauchy("beta", 1)
-            y0 = pm.Lognormal("y0", 0, 1)
+            y0 = pm.LogNormal("y0", 0, 1)
             sigma = pm.HalfCauchy("sigma", 1)
             forward = ode_model(theta=[alpha, beta], y0=[y0])
-            y = pm.Lognormal("y", mu=pm.math.log(forward), sd=sigma, observed=yobs)
+            y = pm.LogNormal("y", mu=pm.math.log(forward), sd=sigma, observed=yobs)
 
             idata = pm.sample(100, tune=0, chains=1)
 
@@ -360,10 +364,10 @@ class TestDiffEqModel:
         ode_model = DifferentialEquation(func=system, t0=0, times=times, n_states=2, n_theta=1)
 
         with pm.Model() as model:
-            R = pm.Lognormal("R", 1, 5, initval=1)
+            R = pm.LogNormal("R", 1, 5, initval=1)
             sigma = pm.HalfCauchy("sigma", 1, shape=2, initval=[0.5, 0.5])
             forward = ode_model(theta=[R], y0=[0.99, 0.01])
-            y = pm.Lognormal("y", mu=pm.math.log(forward), sd=sigma, observed=yobs)
+            y = pm.LogNormal("y", mu=pm.math.log(forward), sd=sigma, observed=yobs)
 
             idata = pm.sample(100, tune=0, chains=1)
 
@@ -403,7 +407,7 @@ class TestDiffEqModel:
             gamma = pm.HalfCauchy("gamma", 1, initval=1)
             sigma = pm.HalfCauchy("sigma", 1, shape=2, initval=[1, 1])
             forward = ode_model(theta=[beta, gamma], y0=[0.99, 0.01])
-            y = pm.Lognormal("y", mu=pm.math.log(forward), sd=sigma, observed=yobs)
+            y = pm.LogNormal("y", mu=pm.math.log(forward), sd=sigma, observed=yobs)
 
             idata = pm.sample(100, tune=0, chains=1)
 

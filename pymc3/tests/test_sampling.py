@@ -174,21 +174,6 @@ class TestSample(SeededTest):
             assert trace.report.n_draws == 100
             assert isinstance(trace.report.t_sampling, float)
 
-    @pytest.mark.xfail(reason="BART not refactored for v4")
-    def test_trace_report_bart(self):
-        X = np.random.normal(0, 1, size=(3, 250)).T
-        Y = np.random.normal(0, 1, size=250)
-        X[:, 0] = np.random.normal(Y, 0.1)
-
-        with pm.Model() as model:
-            mu = pm.BART("mu", X, Y, m=20)
-            sigma = pm.HalfNormal("sigma", 1)
-            y = pm.Normal("y", mu, sigma, observed=Y)
-            trace = pm.sample(500, tune=100, random_seed=3415, return_inferencedata=False)
-        var_imp = trace.report.variable_importance
-        assert var_imp[0] > var_imp[1:].sum()
-        npt.assert_almost_equal(var_imp.sum(), 1)
-
     def test_return_inferencedata(self):
         with self.model:
             kwargs = dict(draws=100, tune=50, cores=1, chains=2, step=pm.Metropolis())
@@ -297,12 +282,21 @@ class TestSample(SeededTest):
             backend = NDArray()
             pm.sample(10, cores=1, chains=2, trace=backend)
 
+    def test_exceptions(self):
+        # Test iteration over MultiTrace NotImplementedError
+        with pm.Model() as model:
+            mu = pm.Normal("mu", 0.0, 1.0)
+            a = pm.Normal("a", mu=mu, sigma=1, observed=np.array([0.5, 0.2]))
+            trace = pm.sample(tune=0, draws=10, chains=2, return_inferencedata=False)
+            with pytest.raises(NotImplementedError):
+                xvars = [t["mu"] for t in trace]
+
 
 @pytest.mark.xfail(reason="Lognormal not refactored for v4")
 def test_sample_find_MAP_does_not_modify_start():
     # see https://github.com/pymc-devs/pymc3/pull/4458
     with pm.Model():
-        pm.Lognormal("untransformed")
+        pm.LogNormal("untransformed")
 
         # make sure find_Map does not modify the start dict
         start = {"untransformed": 2}
@@ -323,7 +317,7 @@ def test_sample_find_MAP_does_not_modify_start():
 def test_empty_model():
     with pm.Model():
         pm.Normal("a", observed=1)
-        with pytest.raises(ValueError) as error:
+        with pytest.raises(SamplingError) as error:
             pm.sample()
         error.match("any free variables")
 
@@ -1057,16 +1051,6 @@ class TestSamplePriorPredictive(SeededTest):
             assert gen_data["theta"].shape == (5000,)
             assert gen_data["psi"].shape == (5000,)
             assert gen_data["suppliers"].shape == (5000, 20)
-
-    @pytest.mark.xfail(reason="Bound not refactored for v4")
-    def test_bounded_dist(self):
-        with pm.Model() as model:
-            BoundedNormal = pm.Bound(pm.Normal, lower=0.0)
-            x = BoundedNormal("x", mu=at.zeros((3, 1)), sd=1 * at.ones((3, 1)), size=(3, 1))
-
-        with model:
-            prior_trace = pm.sample_prior_predictive(5)
-            assert prior_trace["x"].shape == (5, 3, 1)
 
     def test_potentials_warning(self):
         warning_msg = "The effect of Potentials on other parameters is ignored during"

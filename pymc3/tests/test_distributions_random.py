@@ -14,7 +14,6 @@
 import functools
 import itertools
 
-from contextlib import ExitStack as does_not_raise
 from typing import Callable, List, Optional
 
 import aesara
@@ -25,32 +24,40 @@ import pytest
 import scipy.stats as st
 
 from numpy.testing import assert_almost_equal, assert_array_almost_equal
-from packaging.version import parse
-from scipy import __version__ as scipy_version
+
+try:
+    from polyagamma import random_polyagamma
+
+    _polyagamma_not_installed = False
+except ImportError:  # pragma: no cover
+
+    _polyagamma_not_installed = True
+
+    def random_polyagamma(*args, **kwargs):
+        raise RuntimeError("polyagamma package is not installed!")
+
+
 from scipy.special import expit
 
 import pymc3 as pm
 
 from pymc3.aesaraf import change_rv_size, floatX, intX
+from pymc3.distributions import _logp
 from pymc3.distributions.continuous import get_tau_sigma, interpolated
+from pymc3.distributions.discrete import _OrderedLogistic, _OrderedProbit
 from pymc3.distributions.dist_math import clipped_beta_rvs
-from pymc3.distributions.multivariate import quaddist_matrix
+from pymc3.distributions.multivariate import _OrderedMultinomial, quaddist_matrix
 from pymc3.distributions.shape_utils import to_tuple
-from pymc3.exceptions import ShapeError
 from pymc3.tests.helpers import SeededTest, select_by_precision
 from pymc3.tests.test_distributions import (
     Domain,
-    Nat,
     R,
     RandomPdMatrix,
     Rplus,
     Simplex,
-    Vector,
     build_model,
     product,
 )
-
-SCIPY_VERSION = parse(scipy_version)
 
 
 def pymc3_random(
@@ -1019,11 +1026,10 @@ class TestBernoulli(BaseTestDistribution):
     ]
 
 
-@pytest.mark.skip("Still not implemented")
 class TestBernoulliLogitP(BaseTestDistribution):
     pymc_dist = pm.Bernoulli
     pymc_dist_params = {"logit_p": 1.0}
-    expected_rv_op_params = {"mean": 0, "sigma": 10.0}
+    expected_rv_op_params = {"p": expit(1.0)}
     tests_to_run = ["check_pymc_params_match_rv_op"]
 
 
@@ -1178,6 +1184,45 @@ class TestMultinomial(BaseTestDistribution):
     ]
 
 
+class TestDirichletMultinomial(BaseTestDistribution):
+    pymc_dist = pm.DirichletMultinomial
+
+    pymc_dist_params = {"n": 85, "a": np.array([1.0, 2.0, 1.5, 1.5])}
+    expected_rv_op_params = {"n": 85, "a": np.array([1.0, 2.0, 1.5, 1.5])}
+
+    sizes_to_check = [None, 1, (4,), (3, 4)]
+    sizes_expected = [(4,), (1, 4), (4, 4), (3, 4, 4)]
+
+    tests_to_run = [
+        "check_pymc_params_match_rv_op",
+        "test_random_draws",
+        "check_rv_size",
+    ]
+
+    def test_random_draws(self):
+        draws = pm.DirichletMultinomial.dist(
+            n=np.array([5, 100]),
+            a=np.array([[0.001, 0.001, 0.001, 1000], [1000, 1000, 0.001, 0.001]]),
+            size=(2, 3),
+        ).eval()
+        assert np.all(draws.sum(-1) == np.array([5, 100]))
+        assert np.all((draws.sum(-2)[:, :, 0] > 30) & (draws.sum(-2)[:, :, 0] <= 70))
+        assert np.all((draws.sum(-2)[:, :, 1] > 30) & (draws.sum(-2)[:, :, 1] <= 70))
+        assert np.all((draws.sum(-2)[:, :, 2] >= 0) & (draws.sum(-2)[:, :, 2] <= 2))
+        assert np.all((draws.sum(-2)[:, :, 3] > 3) & (draws.sum(-2)[:, :, 3] <= 5))
+
+
+class TestDirichletMultinomial_1d_n_2d_a(BaseTestDistribution):
+    pymc_dist = pm.DirichletMultinomial
+    pymc_dist_params = {
+        "n": np.array([23, 29]),
+        "a": np.array([[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25]]),
+    }
+    sizes_to_check = [None, 1, (4,), (3, 4)]
+    sizes_expected = [(2, 4), (1, 2, 4), (4, 2, 4), (3, 4, 2, 4)]
+    tests_to_run = ["check_rv_size"]
+
+
 class TestCategorical(BaseTestDistribution):
     pymc_dist = pm.Categorical
     pymc_dist_params = {"p": np.array([0.28, 0.62, 0.10])}
@@ -1218,8 +1263,8 @@ class TestLogistic(BaseTestDistribution):
     tests_to_run = ["check_pymc_params_match_rv_op"]
 
 
-class TestLognormal(BaseTestDistribution):
-    pymc_dist = pm.Lognormal
+class TestLogNormal(BaseTestDistribution):
+    pymc_dist = pm.LogNormal
     pymc_dist_params = {"mu": 1.0, "sigma": 5.0}
     expected_rv_op_params = {"mu": 1.0, "sigma": 5.0}
     tests_to_run = ["check_pymc_params_match_rv_op"]
@@ -1281,16 +1326,34 @@ class TestWeibull(BaseTestDistribution):
     ]
 
 
-@pytest.mark.skipif(
-    condition=(SCIPY_VERSION < parse("1.4.0")),
-    reason="betabinom is new in Scipy 1.4.0",
-)
 class TestBetaBinomial(BaseTestDistribution):
     pymc_dist = pm.BetaBinomial
     pymc_dist_params = {"alpha": 2.0, "beta": 1.0, "n": 5}
     expected_rv_op_params = {"n": 5, "alpha": 2.0, "beta": 1.0}
     reference_dist_params = {"n": 5, "a": 2.0, "b": 1.0}
     reference_dist = seeded_scipy_distribution_builder("betabinom")
+    tests_to_run = [
+        "check_pymc_params_match_rv_op",
+        "check_pymc_draws_match_reference",
+        "check_rv_size",
+    ]
+
+
+@pytest.mark.skipif(
+    condition=_polyagamma_not_installed,
+    reason="`polyagamma package is not available/installed.",
+)
+class TestPolyaGamma(BaseTestDistribution):
+    def polyagamma_rng_fn(self, size, h, z, rng):
+        return random_polyagamma(h, z, size=size, random_state=rng._bit_generator)
+
+    pymc_dist = pm.PolyaGamma
+    pymc_dist_params = {"h": 1.0, "z": 0.0}
+    expected_rv_op_params = {"h": 1.0, "z": 0.0}
+    reference_dist_params = {"h": 1.0, "z": 0.0}
+    reference_dist = lambda self: functools.partial(
+        self.polyagamma_rng_fn, rng=self.get_random_state()
+    )
     tests_to_run = [
         "check_pymc_params_match_rv_op",
         "check_pymc_draws_match_reference",
@@ -1432,7 +1495,7 @@ class TestZeroInflatedNegativeBinomial(BaseTestDistribution):
 
 
 class TestOrderedLogistic(BaseTestDistribution):
-    pymc_dist = pm.OrderedLogistic
+    pymc_dist = _OrderedLogistic
     pymc_dist_params = {"eta": 0, "cutpoints": np.array([-2, 0, 2])}
     expected_rv_op_params = {"p": np.array([0.11920292, 0.38079708, 0.38079708, 0.11920292])}
     tests_to_run = [
@@ -1442,9 +1505,24 @@ class TestOrderedLogistic(BaseTestDistribution):
 
 
 class TestOrderedProbit(BaseTestDistribution):
-    pymc_dist = pm.OrderedProbit
+    pymc_dist = _OrderedProbit
     pymc_dist_params = {"eta": 0, "cutpoints": np.array([-2, 0, 2])}
     expected_rv_op_params = {"p": np.array([0.02275013, 0.47724987, 0.47724987, 0.02275013])}
+    tests_to_run = [
+        "check_pymc_params_match_rv_op",
+        "check_rv_size",
+    ]
+
+
+class TestOrderedMultinomial(BaseTestDistribution):
+    pymc_dist = _OrderedMultinomial
+    pymc_dist_params = {"eta": 0, "cutpoints": np.array([-2, 0, 2]), "n": 1000}
+    sizes_to_check = [None, (1), (4,), (3, 2)]
+    sizes_expected = [(4,), (1, 4), (4, 4), (3, 2, 4)]
+    expected_rv_op_params = {
+        "n": 1000,
+        "p": np.array([0.11920292, 0.38079708, 0.38079708, 0.11920292]),
+    }
     tests_to_run = [
         "check_pymc_params_match_rv_op",
         "check_rv_size",
@@ -1484,52 +1562,85 @@ class TestMatrixNormal(BaseTestDistribution):
     mu = np.random.random((3, 3))
     row_cov = np.eye(3)
     col_cov = np.eye(3)
-
+    shape = None
+    size = None
     pymc_dist_params = {"mu": mu, "rowcov": row_cov, "colcov": col_cov}
     expected_rv_op_params = {"mu": mu, "rowcov": row_cov, "colcov": col_cov}
 
-    sizes_to_check = [None, 1, (2, 3)]
-    sizes_expected = [(3,), (1, 3), (2, 3, 3)]
-
-    tests_to_run = ["check_rv_size", "check_pymc_params_match_rv_op", "test_matrix_normal"]
+    tests_to_run = ["check_pymc_params_match_rv_op", "test_matrix_normal", "test_errors"]
 
     def test_matrix_normal(self):
         delta = 0.05  # limit for KS p-value
         n_fails = 10  # Allows the KS fails a certain number of times
-        size = (100,)
 
-        def ref_rand(size, mu, rowcov, colcov):
-            return st.matrix_normal.rvs(mean=mu, rowcov=rowcov, colcov=colcov, size=size)
+        def ref_rand(mu, rowcov, colcov):
+            return st.matrix_normal.rvs(mean=mu, rowcov=rowcov, colcov=colcov)
 
         with pm.Model(rng_seeder=1):
             matrixnormal = pm.MatrixNormal(
-                "mvnormal",
+                "matnormal",
                 mu=np.random.random((3, 3)),
                 rowcov=np.eye(3),
                 colcov=np.eye(3),
-                size=size,
             )
             check = pm.sample_prior_predictive(n_fails)
 
-        ref_smp = ref_rand(size[0], mu=np.random.random((3, 3)), rowcov=np.eye(3), colcov=np.eye(3))
+        ref_smp = ref_rand(mu=np.random.random((3, 3)), rowcov=np.eye(3), colcov=np.eye(3))
 
         p, f = delta, n_fails
         while p <= delta and f > 0:
-            matrixnormal_smp = check["mvnormal"][f - 1, :, :]
-            curr_ref_smp = ref_smp[f - 1, :, :]
+            matrixnormal_smp = check["matnormal"]
 
             p = np.min(
                 [
                     st.ks_2samp(
-                        np.atleast_1d(matrixnormal_smp[..., idx]).flatten(),
-                        np.atleast_1d(curr_ref_smp[..., idx]).flatten(),
-                    )[1]
-                    for idx in range(matrixnormal_smp.shape[-1])
+                        np.atleast_1d(matrixnormal_smp).flatten(),
+                        np.atleast_1d(ref_smp).flatten(),
+                    )
                 ]
             )
             f -= 1
 
         assert p > delta
+
+    def test_errors(self):
+        msg = "MatrixNormal doesn't support size argument"
+        with pm.Model():
+            with pytest.raises(NotImplementedError, match=msg):
+                matrixnormal = pm.MatrixNormal(
+                    "matnormal",
+                    mu=np.random.random((3, 3)),
+                    rowcov=np.eye(3),
+                    colcov=np.eye(3),
+                    size=15,
+                )
+
+        msg = "Value must be two dimensional."
+        with pm.Model():
+            matrixnormal = pm.MatrixNormal(
+                "matnormal",
+                mu=np.random.random((3, 3)),
+                rowcov=np.eye(3),
+                colcov=np.eye(3),
+            )
+            with pytest.raises(ValueError, match=msg):
+                rvs_to_values = {matrixnormal: aesara.tensor.ones((3, 3, 3))}
+                _logp(
+                    matrixnormal.owner.op,
+                    matrixnormal,
+                    rvs_to_values,
+                    *matrixnormal.owner.inputs[3:],
+                )
+
+        with pm.Model():
+            with pytest.warns(DeprecationWarning):
+                matrixnormal = pm.MatrixNormal(
+                    "matnormal",
+                    mu=np.random.random((3, 3)),
+                    rowcov=np.eye(3),
+                    colcov=np.eye(3),
+                    shape=15,
+                )
 
 
 class TestInterpolated(BaseTestDistribution):
@@ -1554,8 +1665,10 @@ class TestInterpolated(BaseTestDistribution):
         for mu in R.vals:
             for sigma in Rplus.vals:
                 # pylint: disable=cell-var-from-loop
+                rng = self.get_random_state()
+
                 def ref_rand(size):
-                    return st.norm.rvs(loc=mu, scale=sigma, size=size)
+                    return st.norm.rvs(loc=mu, scale=sigma, size=size, random_state=rng)
 
                 class TestedInterpolated(pm.Interpolated):
                     rv_op = interpolated
@@ -1566,7 +1679,12 @@ class TestInterpolated(BaseTestDistribution):
                         pdf_points = st.norm.pdf(x_points, loc=mu, scale=sigma)
                         return super().dist(x_points=x_points, pdf_points=pdf_points, **kwargs)
 
-                pymc3_random(TestedInterpolated, {}, ref_rand=ref_rand)
+                pymc3_random(
+                    TestedInterpolated,
+                    {},
+                    extra_args={"rng": aesara.shared(rng)},
+                    ref_rand=ref_rand,
+                )
 
 
 class TestKroneckerNormal(BaseTestDistribution):
@@ -1599,101 +1717,6 @@ class TestKroneckerNormal(BaseTestDistribution):
 
 
 class TestScalarParameterSamples(SeededTest):
-    @pytest.mark.xfail(reason="This distribution has not been refactored for v4")
-    def test_bounded(self):
-        # A bit crude...
-        BoundedNormal = pm.Bound(pm.Normal, upper=0)
-
-        def ref_rand(size, tau):
-            return -st.halfnorm.rvs(size=size, loc=0, scale=tau ** -0.5)
-
-        pymc3_random(BoundedNormal, {"tau": Rplus}, ref_rand=ref_rand)
-
-    def test_skew_normal(self):
-        def ref_rand(size, alpha, mu, sigma):
-            return st.skewnorm.rvs(size=size, a=alpha, loc=mu, scale=sigma)
-
-        pymc3_random(pm.SkewNormal, {"mu": R, "sigma": Rplus, "alpha": R}, ref_rand=ref_rand)
-
-    @pytest.mark.xfail(reason="This distribution has not been refactored for v4")
-    def test_dirichlet_multinomial(self):
-        def ref_rand(size, a, n):
-            k = a.shape[-1]
-            out = np.empty((size, k), dtype=int)
-            for i in range(size):
-                p = nr.dirichlet(a)
-                x = nr.multinomial(n=n, pvals=p)
-                out[i, :] = x
-            return out
-
-        for n in [2, 3]:
-            pymc3_random_discrete(
-                pm.DirichletMultinomial,
-                {"a": Vector(Rplus, n), "n": Nat},
-                valuedomain=Vector(Nat, n),
-                size=1000,
-                ref_rand=ref_rand,
-            )
-
-    @pytest.mark.xfail(reason="This distribution has not been refactored for v4")
-    @pytest.mark.parametrize(
-        "a, shape, n",
-        [
-            [[0.25, 0.25, 0.25, 0.25], 4, 2],
-            [[0.25, 0.25, 0.25, 0.25], (1, 4), 3],
-            [[0.25, 0.25, 0.25, 0.25], (10, 4), [2] * 10],
-            [[0.25, 0.25, 0.25, 0.25], (10, 1, 4), 5],
-            [[[0.25, 0.25, 0.25, 0.25]], (2, 4), [7, 11]],
-            [[[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25]], (2, 4), 13],
-            [[[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25]], (1, 2, 4), [23, 29]],
-            [
-                [[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25]],
-                (10, 2, 4),
-                [31, 37],
-            ],
-            [[[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25]], (2, 4), [17, 19]],
-        ],
-    )
-    def test_dirichlet_multinomial_shape(self, a, shape, n):
-        a = np.asarray(a)
-        with pm.Model() as model:
-            m = pm.DirichletMultinomial("m", n=n, a=a, shape=shape)
-        samp0 = m.random()
-        samp1 = m.random(size=1)
-        samp2 = m.random(size=2)
-
-        shape_ = to_tuple(shape)
-        assert to_tuple(samp0.shape) == shape_
-        assert to_tuple(samp1.shape) == (1, *shape_)
-        assert to_tuple(samp2.shape) == (2, *shape_)
-
-    @pytest.mark.xfail(reason="This distribution has not been refactored for v4")
-    @pytest.mark.parametrize(
-        "n, a, shape, expectation",
-        [
-            ([5], [[1000, 1, 1], [1, 1, 1000]], (2, 3), does_not_raise()),
-            ([5, 3], [[1000, 1, 1], [1, 1, 1000]], (2, 3), does_not_raise()),
-            ([[5]], [[1000, 1, 1], [1, 1, 1000]], (2, 3), pytest.raises(ShapeError)),
-            ([[5], [3]], [[1000, 1, 1], [1, 1, 1000]], (2, 3), pytest.raises(ShapeError)),
-        ],
-    )
-    def test_dirichlet_multinomial_dist_ShapeError(self, n, a, shape, expectation):
-        m = pm.DirichletMultinomial.dist(n=n, a=a, shape=shape)
-        with expectation:
-            m.random()
-
-    def test_logitnormal(self):
-        def ref_rand(size, mu, sigma):
-            return expit(st.norm.rvs(loc=mu, scale=sigma, size=size))
-
-        pymc3_random(pm.LogitNormal, {"mu": R, "sigma": Rplus}, ref_rand=ref_rand)
-
-    def test_moyal(self):
-        def ref_rand(size, mu, sigma):
-            return st.moyal.rvs(loc=mu, scale=sigma, size=size)
-
-        pymc3_random(pm.Moyal, {"mu": R, "sigma": Rplus}, ref_rand=ref_rand)
-
     @pytest.mark.xfail(reason="This distribution has not been refactored for v4")
     def test_lkj(self):
         for n in [2, 10, 50]:
@@ -2387,3 +2410,43 @@ class TestMvGaussianRandomWalk(SeededTest):
             prior = pm.sample_prior_predictive(samples=sample_shape)
 
         assert prior["mv"].shape == to_tuple(sample_shape) + dist_shape
+
+
+@pytest.mark.parametrize("sparse", [True, False])
+def test_car_rng_fn(sparse):
+    delta = 0.05  # limit for KS p-value
+    n_fails = 20  # Allows the KS fails a certain number of times
+    size = (100,)
+
+    W = np.array(
+        [[0.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 1.0, 0.0]]
+    )
+
+    tau = 2
+    alpha = 0.5
+    mu = np.array([1, 1, 1, 1])
+
+    D = W.sum(axis=0)
+    prec = tau * (np.diag(D) - alpha * W)
+    cov = np.linalg.inv(prec)
+    W = aesara.tensor.as_tensor_variable(W)
+    if sparse:
+        W = aesara.sparse.csr_from_dense(W)
+
+    with pm.Model(rng_seeder=1):
+        car = pm.CAR("car", mu, W, alpha, tau, size=size)
+        mn = pm.MvNormal("mn", mu, cov, size=size)
+        check = pm.sample_prior_predictive(n_fails)
+
+    p, f = delta, n_fails
+    while p <= delta and f > 0:
+        car_smp, mn_smp = check["car"][f - 1, :, :], check["mn"][f - 1, :, :]
+        p = min(
+            st.ks_2samp(
+                np.atleast_1d(car_smp[..., idx]).flatten(),
+                np.atleast_1d(mn_smp[..., idx]).flatten(),
+            )[1]
+            for idx in range(car_smp.shape[-1])
+        )
+        f -= 1
+    assert p > delta
