@@ -241,7 +241,7 @@ should conduct their business in an open and public manner unless privacy is
 specifically called for. Private subcommittee communications should happen on
 the main private mailing list of the Council unless specifically called for.
 
-Even if the BDFL does not sit on a specific subcommittee, they still retains
+Even if the BDFL does not sit on a specific subcommittee, they still retain
 override authority on the subcommittee's decisions. However, it is expected that
 they will appoint a delegate to oversee the subcommittee's decisions, and
 explicit intervention from the BDFL will only be sought if the committee
