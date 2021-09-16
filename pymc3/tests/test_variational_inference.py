@@ -40,7 +40,6 @@ from pymc3.variational.approximations import (
 from pymc3.variational.inference import ADVI, ASVGD, NFVI, SVGD, FullRankADVI, fit
 from pymc3.variational.opvi import Approximation, Group, NotImplementedInference
 
-
 pytestmark = pytest.mark.usefixtures("strict_float32", "seeded_test")
 
 
