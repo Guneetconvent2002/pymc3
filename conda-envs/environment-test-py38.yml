@@ -9,7 +9,7 @@ dependencies:
 - cloudpickle
 - fastprogress>=0.2.0
 - h5py>=2.7
-- ipython>=7.16
+- ipython
 - libblas=*=*mkl
 - mkl-service
 - myst-nb

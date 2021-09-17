@@ -6,16 +6,15 @@ dependencies:
  # base dependencies (see install guide for Windows)
 - aesara>=2.1.0
 - arviz>=0.11.2
-- cachetools>=4.2.1
+- cachetools
 - cloudpickle
 - fastprogress>=0.2.0
 - h5py>=2.7
 - libpython
 - mkl-service
 - m2w64-toolchain
-- numba
 - numpy>=1.15.0
-- pandas>=0.24.0
+- pandas
 - pip
 - python=3.8
 - python-graphviz
